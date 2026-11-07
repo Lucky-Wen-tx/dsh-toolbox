@@ -113,11 +113,11 @@ window.__ModuleLoader__.load({
 
 		// ── styles ──────────────────────────────────────────────────────────
 		const STYLE = `
-.dsh-toolbox { display:flex; flex-direction:column; gap:32px; color:var(--dsw-alias-label-primary,#111827); }
-.dsh-toolbox__head { display:flex; flex-direction:column; gap:4px; }
-.dsh-toolbox__title { margin:0; font-size:20px; font-weight:500; line-height:28px; }
-.dsh-toolbox__sub { color:var(--dsw-alias-label-secondary,#6b7280); font-size:13px; line-height:20px; margin:0; }
-.dsh-toolbox__section { display:flex; flex-direction:column; gap:12px; }
+.dsh-toolbox { display:flex; flex-direction:column; gap:32px; max-width:760px; color:var(--dsw-alias-label-primary,#111827); }
+.dsh-toolbox__head { display:flex; flex-direction:column; flex:none; }
+.dsh-toolbox__title { margin:0; font-size:20px; font-weight:500; line-height:28px; color:var(--dsw-alias-label-primary,#111827); }
+.dsh-toolbox__sub { align-items:center; color:var(--dsw-alias-label-secondary,#6b7280); display:flex; font-size:13px; gap:4px; line-height:20px; margin:4px 0 0; }
+.dsh-toolbox__section { display:flex; flex-direction:column; gap:14px; }
 .dsh-toolbox__sectionHead { align-items:baseline; display:flex; gap:10px; }
 .dsh-toolbox__sectionTitle { margin:0; font-size:14px; font-weight:500; line-height:20px; }
 .dsh-toolbox__sectionCount { color:var(--dsw-alias-label-secondary,#6b7280); font-size:12px; line-height:18px; }
@@ -384,9 +384,9 @@ window.__ModuleLoader__.load({
 			}));
 
 			return h('div', { className: 'dsh-toolbox', 'data-dsh-toolbox': '' },
-				h('div', { className: 'dsh-toolbox__head' },
-					h('div', { className: 'dsh-toolbox__title' }, s.title),
-					h('div', { className: 'dsh-toolbox__sub' }, s.subtitle),
+				h('header', { className: 'dsh-toolbox__head' },
+					h('h1', { className: 'dsh-toolbox__title' }, s.title),
+					h('div', { className: 'dsh-toolbox__sub' }, h('span', {}, s.subtitle)),
 				),
 				error === null ? null : h('div', { className: 'dsh-toolbox__error' }, `${s.loadFailed}: ${error}`),
 
