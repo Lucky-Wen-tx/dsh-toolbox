@@ -17,6 +17,8 @@ window.__ModuleLoader__.load({
 		// ── copy ────────────────────────────────────────────────────────────
 		const STRINGS = {
 			zh: {
+				workspacesSection: '工作区',
+				trashSection: '回收站',
 				nav: '会话管理',
 				title: '会话管理',
 				subtitle: '按工作区分组列出会话；删除的会话先进入回收站，可以恢复，彻底删除不可撤销。',
@@ -50,6 +52,8 @@ window.__ModuleLoader__.load({
 				emptyGroup: '（该工作区暂无会话）',
 			},
 			en: {
+				workspacesSection: 'Workspaces',
+				trashSection: 'Trash',
 				nav: 'Sessions',
 				title: 'Session cleanup',
 				subtitle: 'Sessions grouped by workspace. Deleted sessions go to the trash first and can be restored; purging is permanent.',
@@ -109,11 +113,16 @@ window.__ModuleLoader__.load({
 
 		// ── styles ──────────────────────────────────────────────────────────
 		const STYLE = `
-.dsh-toolbox { display:flex; flex-direction:column; gap:12px; color:var(--dsw-alias-label-primary,#111827); font-size:13px; }
-.dsh-toolbox__title { font-size:15px; font-weight:600; }
-.dsh-toolbox__sub { color:var(--dsw-alias-label-tertiary,#9ca3af); font-size:12px; line-height:1.5; }
-.dsh-toolbox__bar { display:flex; align-items:center; gap:8px; }
-.dsh-toolbox__count { color:var(--dsw-alias-label-tertiary,#9ca3af); font-size:12px; flex:1 1 auto; }
+.dsh-toolbox { display:flex; flex-direction:column; gap:14px; color:var(--dsw-alias-label-primary,#111827); font-size:13px; }
+.dsh-toolbox__head { display:flex; flex-direction:column; gap:6px; }
+.dsh-toolbox__title { font-size:20px; font-weight:600; line-height:1.3; letter-spacing:-0.01em; }
+.dsh-toolbox__sub { color:var(--dsw-alias-label-tertiary,#9ca3af); font-size:12.5px; line-height:1.55; }
+.dsh-toolbox__section { display:flex; flex-direction:column; gap:8px; border-top:1px solid var(--dsw-alias-line-border,rgba(127,127,127,.18)); padding-top:16px; }
+.dsh-toolbox__section--first { border-top:0; padding-top:0; }
+.dsh-toolbox__sectionHead { align-items:baseline; display:flex; gap:8px; }
+.dsh-toolbox__sectionTitle { font-size:15px; font-weight:600; line-height:1.4; }
+.dsh-toolbox__sectionCount { color:var(--dsw-alias-label-tertiary,#9ca3af); font-size:12px; font-weight:400; }
+.dsh-toolbox__sectionAction { margin-left:auto; }
 .dsh-toolbox__btn { appearance:none; background:transparent; border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.28)); border-radius:8px; color:inherit; cursor:pointer; font:inherit; font-size:12px; padding:4px 10px; white-space:nowrap; }
 .dsh-toolbox__btn:hover:not(:disabled) { background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.1)); }
 .dsh-toolbox__btn:disabled { cursor:default; opacity:.45; }
@@ -133,12 +142,13 @@ window.__ModuleLoader__.load({
 .dsh-toolbox__tag--orphan { background:rgba(245,158,11,.16); color:#b45309; }
 .dsh-toolbox__tag--sub { background:rgba(77,107,254,.12); color:#3b5bdb; }
 .dsh-toolbox__actions { display:flex; gap:6px; flex:none; }
-.dsh-toolbox__group { border-top:1px solid var(--dsw-alias-line-border,rgba(127,127,127,.14)); margin-top:8px; padding-top:10px; }
-.dsh-toolbox__group:first-child { border-top:0; margin-top:0; padding-top:0; }
-.dsh-toolbox__groupHead { align-items:center; background:transparent; border:0; color:var(--dsw-alias-label-secondary,#6b7280); cursor:pointer; display:flex; font:inherit; font-size:12px; font-weight:600; gap:8px; justify-content:space-between; padding:4px 2px; width:100%; }
+.dsh-toolbox__group { display:flex; flex-direction:column; gap:6px; }
+.dsh-toolbox__group + .dsh-toolbox__group { margin-top:14px; }
+.dsh-toolbox__groupHead { align-items:baseline; background:transparent; border:0; color:var(--dsw-alias-label-primary,#111827); cursor:pointer; display:flex; font:inherit; font-size:14px; font-weight:600; gap:8px; justify-content:space-between; padding:2px 2px 4px; width:100%; }
+.dsh-toolbox__groupHead:hover { color:var(--dsw-alias-label-primary,#111827); }
 .dsh-toolbox__groupName { flex:1 1 auto; min-width:0; overflow:hidden; text-align:left; text-overflow:ellipsis; white-space:nowrap; }
-.dsh-toolbox__groupPath { color:var(--dsw-alias-label-tertiary,#9ca3af); font-size:11px; font-weight:400; margin-left:8px; }
-.dsh-toolbox__groupCount { flex:none; font-weight:400; }
+.dsh-toolbox__groupPath { color:var(--dsw-alias-label-tertiary,#9ca3af); font-size:11.5px; font-weight:400; margin-left:8px; }
+.dsh-toolbox__groupCount { color:var(--dsw-alias-label-tertiary,#9ca3af); flex:none; font-size:12px; font-weight:400; }
 .dsh-toolbox__empty { color:var(--dsw-alias-label-tertiary,#9ca3af); font-size:12px; padding:6px 2px; }
 .dsh-toolbox__error { background:rgba(239,68,68,.12); border-radius:8px; font-size:12px; padding:6px 10px; }
 `;
@@ -265,7 +275,6 @@ window.__ModuleLoader__.load({
 			const [error, setError] = React.useState(null);
 			const [busyId, setBusyId] = React.useState(null);
 			const [collapsed, setCollapsed] = React.useState({});
-			const [trashOpen, setTrashOpen] = React.useState(true);
 			const [orphanOpen, setOrphanOpen] = React.useState(false);
 			const [tick, setTick] = React.useState(0);
 
@@ -375,58 +384,50 @@ window.__ModuleLoader__.load({
 			}));
 
 			return h('div', { className: 'dsh-toolbox', 'data-dsh-toolbox': '' },
-				h('div', { className: 'dsh-toolbox__title' }, s.title),
-				h('div', { className: 'dsh-toolbox__sub' }, s.subtitle),
-				h('div', { className: 'dsh-toolbox__bar' },
-					h('span', { className: 'dsh-toolbox__count' },
-						state === null
-							? s.loading
-							: s.summary(groups.length, sessionCount, formatBytes(totalBytes) || '0 B'),
-					),
-					h('button', {
-						type: 'button',
-						className: 'dsh-toolbox__btn',
-						onClick: () => setTick((n) => n + 1),
-					}, s.refresh),
+				h('div', { className: 'dsh-toolbox__head' },
+					h('div', { className: 'dsh-toolbox__title' }, s.title),
+					h('div', { className: 'dsh-toolbox__sub' }, s.subtitle),
 				),
 				error === null ? null : h('div', { className: 'dsh-toolbox__error' }, `${s.loadFailed}: ${error}`),
 
-				groups.length === 0
-					? h('div', { className: 'dsh-toolbox__empty' }, state === null ? s.loading : s.empty)
-					: h('div', null, ...groups.map(renderGroup)),
-
-				orphans.length === 0 ? null : h('div', { className: 'dsh-toolbox__group' },
-					h('button', {
-						type: 'button',
-						className: 'dsh-toolbox__groupHead',
-						'aria-expanded': orphanOpen ? 'true' : 'false',
-						onClick: () => setOrphanOpen((open) => !open),
-					},
-						h('span', { className: 'dsh-toolbox__groupName' }, s.orphanGroup(orphans.length)),
-						h('span', { className: 'dsh-toolbox__groupCount' }, orphanOpen ? '▾' : '▸'),
+				// ── section 1: workspaces ──────────────────────────────────
+				h('div', { className: 'dsh-toolbox__section dsh-toolbox__section--first' },
+					h('div', { className: 'dsh-toolbox__sectionHead' },
+						h('span', { className: 'dsh-toolbox__sectionTitle' }, s.workspacesSection),
+						h('span', { className: 'dsh-toolbox__sectionCount' },
+							state === null ? s.loading : s.summary(groups.length, sessionCount, formatBytes(totalBytes) || '0 B'),
+						),
+						h('button', {
+							type: 'button',
+							className: 'dsh-toolbox__btn dsh-toolbox__sectionAction',
+							onClick: () => setTick((n) => n + 1),
+						}, s.refresh),
 					),
-					orphanOpen
-						? h('ul', { className: 'dsh-toolbox__list' },
-							...orphans.map((row) => renderRow({ ...row, orphan: true }, 'active', true)))
-						: null,
+					groups.length === 0
+						? h('div', { className: 'dsh-toolbox__empty' }, state === null ? s.loading : s.empty)
+						: h('div', null, ...groups.map(renderGroup)),
 				),
 
-				h('div', { className: 'dsh-toolbox__group' },
-					h('button', {
-						type: 'button',
-						className: 'dsh-toolbox__groupHead',
-						'aria-expanded': trashOpen ? 'true' : 'false',
-						onClick: () => setTrashOpen((open) => !open),
-					},
-						h('span', { className: 'dsh-toolbox__groupName' }, s.trashGroup(trashRows.length, limit)),
-						h('span', { className: 'dsh-toolbox__groupCount' }, trashOpen ? '▾' : '▸'),
+				// ── section 2: trash ───────────────────────────────────────
+				h('div', { className: 'dsh-toolbox__section' },
+					h('div', { className: 'dsh-toolbox__sectionHead' },
+						h('span', { className: 'dsh-toolbox__sectionTitle' }, s.trashSection),
+						h('span', { className: 'dsh-toolbox__sectionCount' }, `${trashRows.length} / ${limit}`),
+						orphans.length === 0 ? null : h('button', {
+							type: 'button',
+							className: 'dsh-toolbox__btn dsh-toolbox__sectionAction',
+							'aria-expanded': orphanOpen ? 'true' : 'false',
+							onClick: () => setOrphanOpen((open) => !open),
+						}, s.orphanGroup(orphans.length)),
 					),
-					trashOpen
-						? (trashRows.length === 0
-							? h('div', { className: 'dsh-toolbox__empty' }, s.trashEmpty)
-							: h('ul', { className: 'dsh-toolbox__list' },
-								...trashRows.map((row) => renderRow(row, 'trash', false))))
-						: null,
+					orphans.length === 0 ? null : (orphanOpen
+						? h('ul', { className: 'dsh-toolbox__list' },
+							...orphans.map((row) => renderRow({ ...row, orphan: true }, 'active', true)))
+						: null),
+					trashRows.length === 0
+						? h('div', { className: 'dsh-toolbox__empty' }, s.trashEmpty)
+						: h('ul', { className: 'dsh-toolbox__list' },
+							...trashRows.map((row) => renderRow(row, 'trash', false))),
 				),
 			);
 		}
