@@ -19,60 +19,68 @@ window.__ModuleLoader__.load({
 			zh: {
 				nav: '会话管理',
 				title: '会话管理',
-				subtitle: '删除的会话先进入回收站，可以恢复；彻底删除不可撤销。',
+				subtitle: '按工作区分组列出会话；删除的会话先进入回收站，可以恢复，彻底删除不可撤销。',
 				refresh: '刷新',
 				loading: '加载中…',
 				loadFailed: '读取会话数据失败',
 				empty: '没有会话。',
 				trashEmpty: '回收站是空的。',
 				trashGroup: (n, limit) => `回收站（${n}/${limit}）`,
-				archivedGroup: (n) => `已归档（${n}）`,
-				summary: (n, size) => `${n} 个会话 · ${size}`,
+				orphanGroup: (n) => `孤儿子会话（${n}）`,
+				ungrouped: '未分组',
+				summary: (groups, n, size) => `${groups} 个工作区 · ${n} 个会话 · ${size}`,
 				unknownTitle: '(无标题)',
 				noCwd: '(未知工作目录)',
 				sizeUnknown: '大小未知',
 				msgs: (n) => `${n} 条消息`,
 				live: '运行中',
 				archived: '已归档',
-				orphan: '孤儿子会话',
+				blank: '空白',
+				subagents: (n) => `${n} 个子代理`,
+				orphan: '父会话已删除',
 				del: '删除',
 				restore: '恢复',
 				purge: '彻底删除',
 				confirmDelete: (title) => `删除会话「${title}」？它会移入回收站，可以恢复。`,
 				confirmPurge: (title) => `彻底删除「${title}」？日志文件会被永久清除，无法恢复。`,
 				deleteFailed: '删除失败',
-				liveRefused: '会话正在运行，无法删除',
+				runningRefused: '会话正在运行，无法删除',
 				menuDelete: '删除会话',
 				menuRunning: '运行中，无法删除',
+				emptyGroup: '（该工作区暂无会话）',
 			},
 			en: {
 				nav: 'Sessions',
 				title: 'Session cleanup',
-				subtitle: 'Deleted sessions go to the trash first and can be restored; purging is permanent.',
+				subtitle: 'Sessions grouped by workspace. Deleted sessions go to the trash first and can be restored; purging is permanent.',
 				refresh: 'Refresh',
 				loading: 'Loading…',
 				loadFailed: 'Failed to read session data',
 				empty: 'No sessions.',
 				trashEmpty: 'The trash is empty.',
 				trashGroup: (n, limit) => `Trash (${n}/${limit})`,
-				archivedGroup: (n) => `Archived (${n})`,
-				summary: (n, size) => `${n} sessions · ${size}`,
+				orphanGroup: (n) => `Orphaned subagents (${n})`,
+				ungrouped: 'Ungrouped',
+				summary: (groups, n, size) => `${groups} workspaces · ${n} sessions · ${size}`,
 				unknownTitle: '(untitled)',
 				noCwd: '(unknown working directory)',
 				sizeUnknown: 'unknown size',
 				msgs: (n) => `${n} messages`,
 				live: 'running',
 				archived: 'archived',
-				orphan: 'orphaned child',
+				blank: 'blank',
+				subagents: (n) => `${n} subagents`,
+				orphan: 'parent deleted',
 				del: 'Delete',
 				restore: 'Restore',
 				purge: 'Purge',
 				confirmDelete: (title) => `Delete "${title}"? It moves to the trash and can be restored.`,
 				confirmPurge: (title) => `Permanently delete "${title}"? Its log files cannot be recovered.`,
 				deleteFailed: 'Delete failed',
-				liveRefused: 'The session is running and cannot be deleted',
+				runningRefused: 'The session is running and cannot be deleted',
 				menuDelete: 'Delete session',
 				menuRunning: 'Running — cannot delete',
+				emptyGroup: '(no sessions in this workspace)',
 			},
 		};
 
@@ -114,16 +122,23 @@ window.__ModuleLoader__.load({
 .dsh-toolbox__list { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:6px; }
 .dsh-toolbox__row { display:flex; align-items:center; gap:10px; border:1px solid var(--dsw-alias-line-border,rgba(127,127,127,.18)); border-radius:10px; padding:8px 10px; }
 .dsh-toolbox__row[data-dim] { opacity:.72; }
+.dsh-toolbox__row[data-child] { margin-left:18px; border-style:dashed; }
 .dsh-toolbox__main { flex:1 1 auto; min-width:0; }
 .dsh-toolbox__name { font-size:13px; line-height:1.4; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .dsh-toolbox__meta { color:var(--dsw-alias-label-tertiary,#9ca3af); font-size:11px; line-height:1.5; margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .dsh-toolbox__tag { display:inline-block; border-radius:6px; font-size:10px; line-height:16px; margin-left:6px; padding:0 6px; vertical-align:middle; }
 .dsh-toolbox__tag--live { background:rgba(34,197,94,.14); color:#15803d; }
 .dsh-toolbox__tag--arch { background:rgba(127,127,127,.16); }
+.dsh-toolbox__tag--blank { background:rgba(127,127,127,.1); }
 .dsh-toolbox__tag--orphan { background:rgba(245,158,11,.16); color:#b45309; }
+.dsh-toolbox__tag--sub { background:rgba(77,107,254,.12); color:#3b5bdb; }
 .dsh-toolbox__actions { display:flex; gap:6px; flex:none; }
 .dsh-toolbox__group { border-top:1px solid var(--dsw-alias-line-border,rgba(127,127,127,.14)); margin-top:8px; padding-top:10px; }
-.dsh-toolbox__groupHead { align-items:center; background:transparent; border:0; color:var(--dsw-alias-label-secondary,#6b7280); cursor:pointer; display:flex; font:inherit; font-size:12px; font-weight:600; justify-content:space-between; padding:4px 2px; width:100%; }
+.dsh-toolbox__group:first-child { border-top:0; margin-top:0; padding-top:0; }
+.dsh-toolbox__groupHead { align-items:center; background:transparent; border:0; color:var(--dsw-alias-label-secondary,#6b7280); cursor:pointer; display:flex; font:inherit; font-size:12px; font-weight:600; gap:8px; justify-content:space-between; padding:4px 2px; width:100%; }
+.dsh-toolbox__groupName { flex:1 1 auto; min-width:0; overflow:hidden; text-align:left; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-toolbox__groupPath { color:var(--dsw-alias-label-tertiary,#9ca3af); font-size:11px; font-weight:400; margin-left:8px; }
+.dsh-toolbox__groupCount { flex:none; font-weight:400; }
 .dsh-toolbox__empty { color:var(--dsw-alias-label-tertiary,#9ca3af); font-size:12px; padding:6px 2px; }
 .dsh-toolbox__error { background:rgba(239,68,68,.12); border-radius:8px; font-size:12px; padding:6px 10px; }
 `;
@@ -182,21 +197,26 @@ window.__ModuleLoader__.load({
 
 		// ── one row ─────────────────────────────────────────────────────────
 		function SessionRow(props) {
-			const { row, s, busy, inTrash, onDelete, onRestore, onPurge } = props;
+			const { row, s, busy, mode, onDelete, onRestore, onPurge, isChild } = props;
 			const title = row.title || s.unknownTitle;
 			const meta = [];
 			meta.push(row.cwd || s.noCwd);
 			const size = formatBytes(row.sizeBytes);
 			meta.push(size === null ? s.sizeUnknown : size);
 			if (typeof row.eventCount === 'number') meta.push(s.msgs(row.eventCount));
-			if (inTrash && row.deletedAt) meta.push(formatTime(row.deletedAt));
+			if (mode === 'trash' && row.deletedAt) meta.push(formatTime(row.deletedAt));
 
 			const tags = [];
-			if (row.live) tags.push(h('span', { key: 'live', className: 'dsh-toolbox__tag dsh-toolbox__tag--live' }, s.live));
-			if (row.archived && !inTrash) tags.push(h('span', { key: 'arch', className: 'dsh-toolbox__tag dsh-toolbox__tag--arch' }, s.archived));
+			if (row.running) tags.push(h('span', { key: 'live', className: 'dsh-toolbox__tag dsh-toolbox__tag--live' }, s.live));
+			if (row.archived && mode !== 'trash') tags.push(h('span', { key: 'arch', className: 'dsh-toolbox__tag dsh-toolbox__tag--arch' }, s.archived));
+			if (row.blank) tags.push(h('span', { key: 'blank', className: 'dsh-toolbox__tag dsh-toolbox__tag--blank' }, s.blank));
+			if (row.isSubagent) tags.push(h('span', { key: 'sub', className: 'dsh-toolbox__tag dsh-toolbox__tag--sub' }, 'subagent'));
 			if (row.orphan) tags.push(h('span', { key: 'orphan', className: 'dsh-toolbox__tag dsh-toolbox__tag--orphan' }, s.orphan));
+			if (Array.isArray(row.subagents) && row.subagents.length > 0) {
+				tags.push(h('span', { key: 'kids', className: 'dsh-toolbox__tag dsh-toolbox__tag--sub' }, s.subagents(row.subagents.length)));
+			}
 
-			const actions = inTrash
+			const actions = mode === 'trash'
 				? [
 					h('button', {
 						key: 'restore',
@@ -209,8 +229,8 @@ window.__ModuleLoader__.load({
 						key: 'purge',
 						type: 'button',
 						className: 'dsh-toolbox__btn dsh-toolbox__btn--danger',
-						disabled: busy || row.live,
-						title: row.live ? s.liveRefused : undefined,
+						disabled: busy || row.running,
+						title: row.running ? s.runningRefused : undefined,
 						onClick: onPurge,
 					}, s.purge),
 				]
@@ -219,13 +239,17 @@ window.__ModuleLoader__.load({
 						key: 'delete',
 						type: 'button',
 						className: 'dsh-toolbox__btn dsh-toolbox__btn--danger',
-						disabled: busy || row.live,
-						title: row.live ? s.liveRefused : undefined,
+						disabled: busy || row.running,
+						title: row.running ? s.runningRefused : undefined,
 						onClick: onDelete,
 					}, s.del),
 				];
 
-			return h('li', { className: 'dsh-toolbox__row', 'data-dim': row.archived || inTrash ? '' : undefined },
+			return h('li', {
+				className: 'dsh-toolbox__row',
+				'data-dim': row.archived || mode === 'trash' ? '' : undefined,
+				'data-child': isChild ? '' : undefined,
+			},
 				h('div', { className: 'dsh-toolbox__main' },
 					h('div', { className: 'dsh-toolbox__name', title }, title, ...tags),
 					h('div', { className: 'dsh-toolbox__meta' }, meta.join(' · ')),
@@ -237,24 +261,13 @@ window.__ModuleLoader__.load({
 		// ── the settings page ───────────────────────────────────────────────
 		function SessionPanel(props) {
 			const s = useLocaleStrings();
-			const useSessions = props.useSessions;
-			// Unconditional hook call: the standard prop is always present on a
-			// settings section, and the store is the shell's own session list.
-			const list = useSessions((snapshot) => snapshot);
 			const [state, setState] = React.useState(null);
 			const [error, setError] = React.useState(null);
 			const [busyId, setBusyId] = React.useState(null);
+			const [collapsed, setCollapsed] = React.useState({});
 			const [trashOpen, setTrashOpen] = React.useState(true);
-			const [archivedOpen, setArchivedOpen] = React.useState(false);
+			const [orphanOpen, setOrphanOpen] = React.useState(false);
 			const [tick, setTick] = React.useState(0);
-
-			const titleOf = React.useCallback((sessionId) => {
-				const byId = list === null || list === undefined ? undefined : list.byId;
-				if (byId === undefined) return undefined;
-				const summary = byId[sessionId];
-				if (summary === undefined) return undefined;
-				return summary.displayTitle || summary.title || undefined;
-			}, [list]);
 
 			const reload = React.useCallback(async () => {
 				try {
@@ -284,47 +297,91 @@ window.__ModuleLoader__.load({
 					await reload();
 				} catch (failure) {
 					const code = failure instanceof Error ? failure.message : '';
-					window.alert(code === 'session-live' ? s.liveRefused : code);
+					window.alert(code === 'session-running' ? s.runningRefused : code);
 				} finally {
 					setBusyId(null);
 				}
 			};
 
-			const rows = state === null ? [] : state.sessions;
+			const groups = state === null ? [] : state.groups;
+			const orphans = state === null ? [] : state.orphans;
 			const entries = state === null ? [] : state.entries;
 			const limit = state === null ? 20 : state.limit;
-			const ids = new Set(rows.map((row) => row.id));
-			const decorated = rows.map((row) => ({
-				...row,
-				title: titleOf(row.id),
-				orphan: typeof row.parentSession === 'string' && !ids.has(row.parentSession),
-			}));
-			const active = decorated.filter((row) => !row.archived);
-			const archived = decorated.filter((row) => row.archived);
-			const trashRows = entries.map((entry) => {
-				const known = decorated.find((row) => row.id === entry.sessionId);
-				return {
-					id: entry.sessionId,
-					title: known === undefined ? entry.title : known.title,
-					cwd: entry.cwd,
-					archived: true,
-					live: known === undefined ? false : known.live,
-					deletedAt: entry.deletedAt,
-				};
-			});
-			const totalBytes = decorated.reduce((sum, row) => sum + (row.sizeBytes || 0), 0);
+			const totalBytes = state === null ? 0 : state.totalBytes;
+			const sessionCount = groups.reduce((sum, group) => sum + group.sessions.length, 0);
+
+			const toggle = (key) => setCollapsed((prev) => ({ ...prev, [key]: prev[key] !== true }));
 
 			const askDelete = (row) => {
 				if (!window.confirm(s.confirmDelete(row.title || s.unknownTitle))) return;
 				void withBusy(row.id, () => post(DELETE_ROUTE, { sessionId: row.id, title: row.title }));
 			};
 
+			const renderRow = (row, mode, isChild) => h(SessionRow, {
+				key: row.id,
+				row,
+				s,
+				mode,
+				isChild,
+				busy: busyId === row.id,
+				onDelete: () => askDelete(row),
+				onRestore: () => {
+					void withBusy(row.id, () => post(RESTORE_ROUTE, { sessionId: row.id }));
+				},
+				onPurge: () => {
+					if (!window.confirm(s.confirmPurge(row.title || s.unknownTitle))) return;
+					void withBusy(row.id, () => post(PURGE_ROUTE, { sessionId: row.id }));
+				},
+			});
+
+			const renderGroup = (group, index) => {
+				const key = group.workspaceId || '__ungrouped__';
+				const isOpen = collapsed[key] !== true;
+				const label = group.title === null ? s.ungrouped : group.title;
+				const rows = [];
+				for (const row of group.sessions) {
+					rows.push(renderRow(row, 'active', false));
+					for (const child of row.subagents || []) rows.push(renderRow(child, 'active', true));
+				}
+				return h('div', { className: 'dsh-toolbox__group', key },
+					h('button', {
+						type: 'button',
+						className: 'dsh-toolbox__groupHead',
+						'aria-expanded': isOpen ? 'true' : 'false',
+						onClick: () => toggle(key),
+					},
+						h('span', { className: 'dsh-toolbox__groupName' },
+							label,
+							group.path === null ? null : h('span', { className: 'dsh-toolbox__groupPath' }, group.path),
+						),
+						h('span', { className: 'dsh-toolbox__groupCount' }, `${group.sessions.length} ${isOpen ? '▾' : '▸'}`),
+					),
+					isOpen
+						? (group.sessions.length === 0
+							? h('div', { className: 'dsh-toolbox__empty' }, s.emptyGroup)
+							: h('ul', { className: 'dsh-toolbox__list' }, ...rows))
+						: null,
+				);
+			};
+
+			const trashRows = entries.map((entry) => ({
+				id: entry.sessionId,
+				title: entry.title,
+				cwd: entry.cwd,
+				archived: true,
+				running: false,
+				isSubagent: entry.isSubagent === true,
+				deletedAt: entry.deletedAt,
+			}));
+
 			return h('div', { className: 'dsh-toolbox', 'data-dsh-toolbox': '' },
 				h('div', { className: 'dsh-toolbox__title' }, s.title),
 				h('div', { className: 'dsh-toolbox__sub' }, s.subtitle),
 				h('div', { className: 'dsh-toolbox__bar' },
 					h('span', { className: 'dsh-toolbox__count' },
-						state === null ? s.loading : s.summary(active.length, formatBytes(totalBytes) || '0 B'),
+						state === null
+							? s.loading
+							: s.summary(groups.length, sessionCount, formatBytes(totalBytes) || '0 B'),
 					),
 					h('button', {
 						type: 'button',
@@ -334,37 +391,23 @@ window.__ModuleLoader__.load({
 				),
 				error === null ? null : h('div', { className: 'dsh-toolbox__error' }, `${s.loadFailed}: ${error}`),
 
-				active.length === 0
+				groups.length === 0
 					? h('div', { className: 'dsh-toolbox__empty' }, state === null ? s.loading : s.empty)
-					: h('ul', { className: 'dsh-toolbox__list' },
-						...active.map((row) => h(SessionRow, {
-							key: row.id,
-							row,
-							s,
-							busy: busyId === row.id,
-							inTrash: false,
-							onDelete: () => askDelete(row),
-						})),
-					),
+					: h('div', null, ...groups.map(renderGroup)),
 
-				archived.length === 0 ? null : h('div', { className: 'dsh-toolbox__group' },
+				orphans.length === 0 ? null : h('div', { className: 'dsh-toolbox__group' },
 					h('button', {
 						type: 'button',
 						className: 'dsh-toolbox__groupHead',
-						'aria-expanded': archivedOpen ? 'true' : 'false',
-						onClick: () => setArchivedOpen((open) => !open),
-					}, s.archivedGroup(archived.length), archivedOpen ? '▾' : '▸'),
-					archivedOpen
+						'aria-expanded': orphanOpen ? 'true' : 'false',
+						onClick: () => setOrphanOpen((open) => !open),
+					},
+						h('span', { className: 'dsh-toolbox__groupName' }, s.orphanGroup(orphans.length)),
+						h('span', { className: 'dsh-toolbox__groupCount' }, orphanOpen ? '▾' : '▸'),
+					),
+					orphanOpen
 						? h('ul', { className: 'dsh-toolbox__list' },
-							...archived.map((row) => h(SessionRow, {
-								key: row.id,
-								row,
-								s,
-								busy: busyId === row.id,
-								inTrash: false,
-								onDelete: () => askDelete(row),
-							})),
-						)
+							...orphans.map((row) => renderRow({ ...row, orphan: true }, 'active', true)))
 						: null,
 				),
 
@@ -374,26 +417,15 @@ window.__ModuleLoader__.load({
 						className: 'dsh-toolbox__groupHead',
 						'aria-expanded': trashOpen ? 'true' : 'false',
 						onClick: () => setTrashOpen((open) => !open),
-					}, s.trashGroup(trashRows.length, limit), trashOpen ? '▾' : '▸'),
+					},
+						h('span', { className: 'dsh-toolbox__groupName' }, s.trashGroup(trashRows.length, limit)),
+						h('span', { className: 'dsh-toolbox__groupCount' }, trashOpen ? '▾' : '▸'),
+					),
 					trashOpen
 						? (trashRows.length === 0
 							? h('div', { className: 'dsh-toolbox__empty' }, s.trashEmpty)
 							: h('ul', { className: 'dsh-toolbox__list' },
-								...trashRows.map((row) => h(SessionRow, {
-									key: row.id,
-									row,
-									s,
-									busy: busyId === row.id,
-									inTrash: true,
-									onRestore: () => {
-										void withBusy(row.id, () => post(RESTORE_ROUTE, { sessionId: row.id }));
-									},
-									onPurge: () => {
-										if (!window.confirm(s.confirmPurge(row.title || s.unknownTitle))) return;
-										void withBusy(row.id, () => post(PURGE_ROUTE, { sessionId: row.id }));
-									},
-								})),
-							))
+								...trashRows.map((row) => renderRow(row, 'trash', false))))
 						: null,
 				),
 			);
@@ -415,10 +447,22 @@ window.__ModuleLoader__.load({
 					try {
 						const state = await fetchState();
 						if (cancelled) return;
-						const row = state.sessions.find((candidate) => candidate.id === sessionId);
-						setRunning(row !== undefined && row.live === true);
+						for (const group of state.groups) {
+							for (const row of group.sessions) {
+								if (row.id === sessionId) {
+									setRunning(row.running === true);
+									return;
+								}
+								for (const child of row.subagents || []) {
+									if (child.id === sessionId) {
+										setRunning(child.running === true);
+										return;
+									}
+								}
+							}
+						}
 					} catch {
-						// Leave it enabled; the host refuses a live session anyway.
+						// Leave it enabled; the host refuses a running session anyway.
 					}
 				})();
 				return () => {
@@ -436,7 +480,7 @@ window.__ModuleLoader__.load({
 						await post(DELETE_ROUTE, { sessionId, title: displayTitle });
 					} catch (failure) {
 						const code = failure instanceof Error ? failure.message : '';
-						window.alert(code === 'session-live' ? s.liveRefused : `${s.deleteFailed}: ${code}`);
+						window.alert(code === 'session-running' ? s.runningRefused : `${s.deleteFailed}: ${code}`);
 					} finally {
 						setBusy(false);
 					}
