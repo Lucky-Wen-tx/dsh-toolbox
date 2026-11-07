@@ -1,0 +1,9 @@
+# dsh-toolbox bundle patch.
+#
+# One package, one row per feature. Adding a feature means adding a row here and
+# an export in package.json — the other rows keep their own lifecycle, so
+# `disabled: true` on one never touches the rest.
+- insert:
+    # Session cleanup: list, soft-delete into a trash, restore, purge.
+    - id: dsh-toolbox-sessions
+      name: dsh-toolbox
