@@ -25,7 +25,7 @@
  */
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { existsSync, readdirSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
 
 export const name = 'dsh-toolbox-sessions'
@@ -35,8 +35,13 @@ export const inject = []
 const ROUTE_PREFIX = '/dsh-toolbox'
 const MAX_BODY_BYTES = 64 * 1024
 const TRASH_LIMIT = 20
-/** Session ids are joined into a path, so keep the charset tight. */
+/**
+ * Session ids are joined into a path, so keep the charset tight. A bare `.`
+ * or `..` is rejected separately: both match this charset but resolve to a
+ * parent directory, so `trashDir()` would point at the trash root itself.
+ */
 const SESSION_ID_RE = /^[A-Za-z0-9_.:-]+$/
+const DOT_SEGMENT_RE = /^\.+$/
 
 // ── paths ──────────────────────────────────────────────────────────────────
 
@@ -65,6 +70,91 @@ function sessionsRoot() {
  */
 function projectionCacheFile(sessionId) {
   return join(dshHome(), 'storages', 'session_projcache', 'sessions', `${sessionId}.json`)
+}
+
+/**
+ * One path segment, encoded the way `dsh-session-persistence-jsonl` encodes
+ * it: `[A-Za-z0-9._-]` survives, everything else becomes `~XXXX` (uppercase,
+ * 4 hex digits). `~` itself is escaped, so the mapping is injective.
+ *
+ * This is a copy of the backend's own rule, not a guess: the trash fallback
+ * has to rebuild a session's original path without asking the backend, and a
+ * near-miss here would restore files into the wrong directory.
+ */
+function encodeSegment(raw) {
+  if (raw.length === 0) throw new Error('cannot encode an empty path segment')
+  if (raw === '.') return '~002E'
+  if (raw === '..') return '~002E~002E'
+  let out = ''
+  for (let i = 0; i < raw.length; i += 1) {
+    const code = raw.charCodeAt(i)
+    const ch = String.fromCharCode(code)
+    if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) out += ch
+    else out += `~${code.toString(16).toUpperCase().padStart(4, '0')}`
+  }
+  return out
+}
+
+/**
+ * The project directory key for one working directory: separators and drive
+ * colons collapse to a single `-`, other unsafe code units use the same
+ * `~XXXX` escape, and the result is wrapped in `--…--`.
+ *
+ * `D:\Code\Personal\dsh-toolbox` becomes `--D-Code-Personal-dsh-toolbox--`,
+ * which is the layout on disk.
+ */
+function projectKey(cwd) {
+  if (cwd.length === 0) throw new Error('cannot encode an empty project path')
+  let readable = ''
+  let separatorRun = false
+  for (let i = 0; i < cwd.length; i += 1) {
+    const code = cwd.charCodeAt(i)
+    const ch = String.fromCharCode(code)
+    if (ch === '/' || ch === '\\' || ch === ':') {
+      if (!separatorRun) readable += '-'
+      separatorRun = true
+    } else if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) {
+      readable += ch
+      separatorRun = false
+    } else {
+      readable += `~${code.toString(16).toUpperCase().padStart(4, '0')}`
+      separatorRun = false
+    }
+  }
+  return `--${(readable.replace(/^-+/, '') || 'root').slice(0, 251)}--`
+}
+
+/**
+ * The directory a session's log lives in, derived from its header alone:
+ * `<DSH_HOME>/sessions/<projectKey(cwd)>/<encodeSegment(id)>`.
+ *
+ * `undefined` when the header carries no cwd, because that layout puts the
+ * session under `_no-cwd` and a restore into the wrong bucket is worse than
+ * reporting that the path cannot be rebuilt.
+ */
+function derivedSessionDir(cwd, sessionId) {
+  if (typeof cwd !== 'string' || cwd === '') return undefined
+  try {
+    return join(sessionsRoot(), projectKey(cwd), encodeSegment(sessionId))
+  } catch {
+    return undefined
+  }
+}
+
+/** Whether `candidate` is a real directory strictly inside the sessions root. */
+function isInsideSessionsRoot(candidate) {
+  if (typeof candidate !== 'string' || candidate === '') return false
+  const root = resolve(sessionsRoot())
+  const normalizedRoot = root.endsWith(sep) ? root : `${root}${sep}`
+  const resolved = resolve(candidate)
+  // Case-insensitive on Windows, where `D:\` and `d:\` name one directory.
+  const comparable = process.platform === 'win32'
+    ? [resolved.toLowerCase(), normalizedRoot.toLowerCase()]
+    : [resolved, normalizedRoot]
+  if (!comparable[0].startsWith(comparable[1])) return false
+  // A bare `sessions` root or one of its project directories is not a session
+  // directory, so the segment below the root must be two levels deep.
+  return relative(root, resolved).split(sep).filter(Boolean).length >= 2
 }
 
 // ── small helpers ──────────────────────────────────────────────────────────
@@ -103,6 +193,8 @@ function respond(res, status, payload) {
 function parseSessionId(body) {
   const value = body && typeof body === 'object' ? body.sessionId : undefined
   if (typeof value !== 'string' || !SESSION_ID_RE.test(value)) return undefined
+  // `.` and `..` pass the charset but name a directory, not a session.
+  if (DOT_SEGMENT_RE.test(value)) return undefined
   return value
 }
 
@@ -115,21 +207,34 @@ function headerOf(item) {
  * Locate one session's artifact directory.
  *
  * Preferred source is the snapshot's own `location.path`; otherwise fall back
- * to the on-disk layout `<DSH_HOME>/sessions/<encoded-cwd>/<sessionId>/`.
+ * to the on-disk layout `<DSH_HOME>/sessions/<projectKey(cwd)>/<encoded id>/`.
+ *
+ * Every candidate must resolve inside the sessions root, so a snapshot that
+ * points somewhere else cannot make the trash move an unrelated directory.
  */
-function locateSessionDir(location, sessionId) {
+function locateSessionDir(location, sessionId, cwd) {
   if (location && typeof location.path === 'string') {
     const candidate = location.path
     const dir = candidate.endsWith('.jsonl') || candidate.endsWith('.zstd') ? dirname(candidate) : candidate
-    if (existsSync(dir)) return dir
+    if (existsSync(dir) && isInsideSessionsRoot(dir)) return dir
   }
   const root = sessionsRoot()
   if (!existsSync(root)) return undefined
+  // The cwd-derived path first: it is the layout the backend writes, and
+  // unlike the scan below it costs one stat instead of one per project.
+  const derived = derivedSessionDir(cwd, sessionId)
+  if (derived !== undefined && existsSync(derived) && isInsideSessionsRoot(derived)) return derived
+  let encoded
+  try {
+    encoded = encodeSegment(sessionId)
+  } catch {
+    return undefined
+  }
   try {
     for (const entry of readdirSync(root, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue
-      const dir = join(root, entry.name, sessionId)
-      if (existsSync(dir)) return dir
+      const dir = join(root, entry.name, encoded)
+      if (existsSync(dir) && isInsideSessionsRoot(dir)) return dir
     }
   } catch {
     return undefined
@@ -148,6 +253,22 @@ async function readIndex() {
     // Missing or unreadable index is an empty trash, never a hard failure.
   }
   return []
+}
+
+/**
+ * Serialize every read-modify-write of the trash index.
+ *
+ * Two concurrent deletes would otherwise both read the same entries, each
+ * append its own, and the second write would drop the first entry while its
+ * directory stayed on disk — an entry nobody can restore or purge.
+ */
+let indexChain = Promise.resolve()
+function withIndexLock(run) {
+  const next = indexChain.then(run, run)
+  // Keep the chain alive after a rejection: a failed delete must not wedge
+  // every later one.
+  indexChain = next.then(() => undefined, () => undefined)
+  return next
 }
 
 async function writeIndex(entries) {
@@ -221,8 +342,7 @@ export function apply(ctx) {
           formatStatus: summary.formatStatus,
           archived: archived.has(id),
           sizeBytes: snapshot?.sizeBytes,
-          eventCount: snapshot?.eventCount,
-          dir: locateSessionDir(snapshot?.location, id),
+          dir: locateSessionDir(snapshot?.location, id, summary.cwd ?? header?.cwd),
           subagents: [],
         }
       })
@@ -341,8 +461,6 @@ export function apply(ctx) {
             return respond(res, 409, { ok: false, error: 'session-running' })
           }
 
-          const entries = await readIndex()
-          const existing = entries.find((entry) => entry.sessionId === id)
           const snapshot = persistence() === undefined
             ? undefined
             : (await persistence().list()).find((item) => headerOf(item).id === id)
@@ -351,46 +469,63 @@ export function apply(ctx) {
             return respond(res, 404, { ok: false, error: 'session-not-found' })
           }
 
-          const dir = locateSessionDir(snapshot?.location, id)
+          const dir = locateSessionDir(snapshot?.location, id, summary?.cwd ?? header?.cwd)
+          const archiveNeeded = summary === undefined || summary.origin !== 'subagent'
 
           // 1) Hide it from every client first: the official archive call is
           //    public, reversible, and independent of the file move. Subagent
           //    children have no workspace accounting, so archiving is skipped
           //    for them rather than throwing.
-          if (summary === undefined || summary.origin !== 'subagent') {
-            await registry()?.archiveSession(id)
-          }
+          if (archiveNeeded) await registry()?.archiveSession(id)
 
           // 2) Move the artifact. A session with no directory (already gone,
           //    or never materialized) still gets an index entry so Restore can
           //    undo the archive.
           let moved = false
           if (dir !== undefined) {
-            await mkdir(trashRoot(), { recursive: true })
-            await rm(trashDir(id), { recursive: true, force: true })
-            await rename(dir, trashDir(id))
-            moved = true
+            try {
+              await mkdir(trashRoot(), { recursive: true })
+              await rm(trashDir(id), { recursive: true, force: true })
+              await rename(dir, trashDir(id))
+              moved = true
+            } catch (error) {
+              // Archiving already hid the session, so a failed move would
+              // leave it invisible yet on disk and absent from the trash.
+              // Put the archive back and fail the whole delete instead.
+              if (archiveNeeded) await registry()?.unarchiveSession(id).catch(() => {})
+              throw error
+            }
           }
 
-          // 3) Record it, evicting the oldest entries past the cap.
-          const next = existing !== undefined
-            ? entries.map((entry) => (entry.sessionId === id ? { ...entry, deletedAt: Date.now() } : entry))
-            : [...entries, {
-                sessionId: id,
-                title: typeof body.title === 'string' ? body.title : undefined,
-                cwd: summary?.cwd ?? header?.cwd,
-                originalPath: dir,
-                isSubagent: summary?.origin === 'subagent',
-                moved,
-                deletedAt: Date.now(),
-              }]
-          const overflow = next.length > TRASH_LIMIT ? next.slice(0, next.length - TRASH_LIMIT) : []
-          await writeIndex(next.slice(-TRASH_LIMIT))
-          for (const entry of overflow) {
-            await rm(trashDir(entry.sessionId), { recursive: true, force: true }).catch(() => {})
-          }
+          // 3) Record it, evicting the oldest entries past the cap. The index
+          //    is the only place a restore learns the original path from, so
+          //    every read-modify-write runs under one lock.
+          const overflow = await withIndexLock(async () => {
+            const entries = await readIndex()
+            const existing = entries.find((entry) => entry.sessionId === id)
+            const next = existing !== undefined
+              ? entries.map((entry) => (entry.sessionId === id ? { ...entry, deletedAt: Date.now() } : entry))
+              : [...entries, {
+                  sessionId: id,
+                  title: typeof body.title === 'string' ? body.title : undefined,
+                  cwd: summary?.cwd ?? header?.cwd,
+                  originalPath: dir,
+                  isSubagent: summary?.origin === 'subagent',
+                  moved,
+                  deletedAt: Date.now(),
+                }]
+            const dropped = next.length > TRASH_LIMIT ? next.slice(0, next.length - TRASH_LIMIT) : []
+            // Drop the directories BEFORE the index stops naming them: a
+            // failure here leaves an entry that a later delete can still
+            // evict, never a directory no entry points at.
+            for (const entry of dropped) {
+              await rm(trashDir(entry.sessionId), { recursive: true, force: true }).catch(() => {})
+            }
+            await writeIndex(next.slice(-TRASH_LIMIT))
+            return dropped
+          })
 
-          respond(res, 200, { ok: true })
+          respond(res, 200, { ok: true, evicted: overflow.length })
         } catch (error) {
           scoped.logger.warn('[dsh-toolbox] delete failed:', error)
           respond(res, 500, { ok: false, error: 'delete-failed' })
@@ -414,26 +549,54 @@ export function apply(ctx) {
         if (id === undefined) return respond(res, 400, { ok: false, error: 'invalid-session-id' })
 
         try {
-          const entries = await readIndex()
-          const entry = entries.find((candidate) => candidate.sessionId === id)
-          if (entry === undefined) return respond(res, 404, { ok: false, error: 'trash-entry-not-found' })
+          const entry = await withIndexLock(async () => {
+            const entries = await readIndex()
+            const found = entries.find((candidate) => candidate.sessionId === id)
+            if (found === undefined) return undefined
 
-          const from = trashDir(id)
-          if (existsSync(from) && typeof entry.originalPath === 'string') {
-            if (existsSync(entry.originalPath)) {
-              // Something recreated the original location: the newer copy wins.
-              await rm(from, { recursive: true, force: true })
-            } else {
-              await mkdir(dirname(entry.originalPath), { recursive: true })
-              await rename(from, entry.originalPath)
+            // The recorded path is a hint, not authority: it may predate a
+            // layout change, point outside the sessions root, or be stale
+            // after an earlier partial restore. Trust it only while it is a
+            // real session directory under the root; otherwise rebuild it from
+            // the header, so a session is never lost because one field went bad.
+            const derived = derivedSessionDir(found.cwd, id)
+            const recorded = typeof found.originalPath === 'string'
+              && isInsideSessionsRoot(found.originalPath)
+              && existsSync(found.originalPath)
+              ? found.originalPath
+              : undefined
+            // Prefer the derived path when the recorded one is a different
+            // shape: the backend's own layout is the one it will look in.
+            const target = derived !== undefined && (recorded === undefined || recorded !== derived)
+              ? derived
+              : recorded ?? derived
+
+            const from = trashDir(id)
+            if (existsSync(from)) {
+              if (target === undefined) {
+                // Nothing to restore into: keep the entry and report it
+                // rather than deleting the only copy of the log.
+                return { error: 'restore-path-unknown' }
+              }
+              if (existsSync(target)) {
+                // Something recreated the original location: the newer copy wins.
+                await rm(from, { recursive: true, force: true })
+              } else {
+                await mkdir(dirname(target), { recursive: true })
+                await rename(from, target)
+              }
             }
-          }
 
-          if (entry.isSubagent !== true) {
-            await registry()?.unarchiveSession(id)
-          }
-          await writeIndex(entries.filter((candidate) => candidate.sessionId !== id))
-          respond(res, 200, { ok: true })
+            if (found.isSubagent !== true) {
+              await registry()?.unarchiveSession(id)
+            }
+            await writeIndex(entries.filter((candidate) => candidate.sessionId !== id))
+            return { entry: found, target }
+          })
+
+          if (entry === undefined) return respond(res, 404, { ok: false, error: 'trash-entry-not-found' })
+          if (entry.error !== undefined) return respond(res, 409, { ok: false, error: entry.error })
+          respond(res, 200, { ok: true, restoredTo: entry.target })
         } catch (error) {
           scoped.logger.warn('[dsh-toolbox] restore failed:', error)
           respond(res, 500, { ok: false, error: 'restore-failed' })
@@ -457,22 +620,32 @@ export function apply(ctx) {
         if (id === undefined) return respond(res, 400, { ok: false, error: 'invalid-session-id' })
 
         try {
-          const entries = await readIndex()
-          const entry = entries.find((candidate) => candidate.sessionId === id)
-          if (entry === undefined) return respond(res, 404, { ok: false, error: 'trash-entry-not-found' })
-
           const summary = await findSummary(id)
           if (summary !== undefined && summary.running === true) {
             return respond(res, 409, { ok: false, error: 'session-running' })
           }
 
-          await rm(trashDir(id), { recursive: true, force: true })
-          if (typeof entry.originalPath === 'string') {
-            await rm(entry.originalPath, { recursive: true, force: true })
-          }
-          // The projection cache holds a per-session record outside the log
-          // directory; leaving it behind is the usual "still not clean" report.
-          await rm(projectionCacheFile(id), { force: true }).catch(() => {})
+          const purged = await withIndexLock(async () => {
+            const entries = await readIndex()
+            const found = entries.find((candidate) => candidate.sessionId === id)
+            if (found === undefined) return undefined
+
+            await rm(trashDir(id), { recursive: true, force: true })
+            // Never delete a recorded path that escapes the sessions root: the
+            // index is user-editable text, and a corrupted field must not turn
+            // "purge one session" into "delete an unrelated directory".
+            if (typeof found.originalPath === 'string' && isInsideSessionsRoot(found.originalPath)) {
+              await rm(found.originalPath, { recursive: true, force: true })
+            }
+            // The projection cache holds a per-session record outside the log
+            // directory; leaving it behind is the usual "still not clean" report.
+            await rm(projectionCacheFile(id), { force: true }).catch(() => {})
+
+            await writeIndex(entries.filter((candidate) => candidate.sessionId !== id))
+            return found
+          })
+
+          if (purged === undefined) return respond(res, 404, { ok: false, error: 'trash-entry-not-found' })
 
           // Drop the workspace accounting slot too, so the id does not linger
           // in `sessionIds` forever. `detachSession` is the public API for it.
@@ -489,7 +662,6 @@ export function apply(ctx) {
             // Not archived is already the desired state.
           }
 
-          await writeIndex(entries.filter((candidate) => candidate.sessionId !== id))
           respond(res, 200, { ok: true })
         } catch (error) {
           scoped.logger.warn('[dsh-toolbox] purge failed:', error)
