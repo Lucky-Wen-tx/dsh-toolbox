@@ -13,6 +13,8 @@ window.__ModuleLoader__.load({
 		const DELETE_ROUTE = '/dsh-toolbox/delete';
 		const RESTORE_ROUTE = '/dsh-toolbox/restore';
 		const PURGE_ROUTE = '/dsh-toolbox/purge';
+		/** How long the refresh spinner stays up at minimum, in milliseconds. */
+		const MIN_SPIN_MS = 1000;
 
 		// ── copy ────────────────────────────────────────────────────────────
 		const STRINGS = {
@@ -34,7 +36,6 @@ window.__ModuleLoader__.load({
 				unknownTitle: '(无标题)',
 				noCwd: '(未知工作目录)',
 				sizeUnknown: '大小未知',
-				msgs: (n) => `${n} 条消息`,
 				live: '运行中',
 				archived: '已归档',
 				blank: '空白',
@@ -69,7 +70,6 @@ window.__ModuleLoader__.load({
 				unknownTitle: '(untitled)',
 				noCwd: '(unknown working directory)',
 				sizeUnknown: 'unknown size',
-				msgs: (n) => `${n} messages`,
 				live: 'running',
 				archived: 'archived',
 				blank: 'blank',
@@ -127,6 +127,35 @@ window.__ModuleLoader__.load({
 			h('path', { d: 'M4 6.5 8 10.5 12 6.5' }),
 		);
 
+		// The loading spinner: a light grey hollow ring with one darker arc that
+		// rotates around it at a constant speed. The arc is a quarter of the
+		// circumference with a round cap, so the head reads as a moving segment
+		// rather than a blinking dot.
+		const SPINNER = h('svg', {
+			className: 'dsh-toolbox__spinner',
+			width: 14,
+			height: 14,
+			viewBox: '0 0 16 16',
+			fill: 'none',
+			strokeWidth: 1.75,
+			strokeLinecap: 'round',
+			'aria-hidden': 'true',
+			focusable: 'false',
+		},
+			// The pale track the dark arc travels along.
+			h('circle', {
+				cx: 8, cy: 8, r: 6,
+				stroke: 'var(--dsw-alias-label-tertiary,#9ca3af)',
+				opacity: 0.28,
+			}),
+			// The darker quarter that spins.
+			h('path', {
+				d: 'M8 2a6 6 0 0 1 6 6',
+				stroke: 'var(--dsw-alias-label-secondary,#6b7280)',
+				opacity: 1,
+			}),
+		);
+
 		// ── styles ──────────────────────────────────────────────────────────
 		// The header block restates the built-in plugins page (ui-settings-plugins:
 		// `.section{gap:12px}`, `.heading{18px/600, margin:0}`,
@@ -151,6 +180,23 @@ window.__ModuleLoader__.load({
 .dsh-toolbox__btn:active:not(:disabled) { background:var(--dsw-alias-interactive-bg-active,rgba(127,127,127,.16)); }
 .dsh-toolbox__btn:focus-visible { outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,#4d6bfe)); outline-offset:2px; }
 .dsh-toolbox__btn:disabled { cursor:default; opacity:.45; }
+/*
+ * The refresh button keeps its label in the DOM while loading, merely hidden,
+ * and centres the spinner over the same box. The label therefore keeps
+ * measuring exactly what it measured before, so the button width is identical
+ * in both states and the section header never shifts — for any language and
+ * any font, without hard-coding a width per translation.
+ */
+.dsh-toolbox__btn--refresh { box-sizing:border-box; display:inline-flex; align-items:center; justify-content:center; position:relative; }
+.dsh-toolbox__label { display:block; }
+.dsh-toolbox__btn--busy .dsh-toolbox__label { visibility:hidden; }
+/* The spinner gets its own full-bleed layer so its rotation transform stays its own. */
+.dsh-toolbox__spinnerLayer { align-items:center; display:flex; inset:0; justify-content:center; position:absolute; }
+/* A busy button keeps full opacity: the spinner must stay legible. */
+.dsh-toolbox__btn--busy:disabled { cursor:default; opacity:1; }
+.dsh-toolbox__spinner { display:block; flex:none; }
+@media (prefers-reduced-motion:no-preference) { .dsh-toolbox__spinner { animation:dsh-toolbox-spin .8s linear infinite; } }
+@keyframes dsh-toolbox-spin { to { transform:rotate(360deg); } }
 .dsh-toolbox__btn--danger { border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary,#dc2626) 45%, transparent); color:var(--dsw-alias-state-error-primary,#dc2626); }
 .dsh-toolbox__btn--danger:hover:not(:disabled) { background:color-mix(in srgb, var(--dsw-alias-state-error-primary,#dc2626) 10%, transparent); }
 .dsh-toolbox__groups { display:flex; flex-direction:column; }
@@ -235,6 +281,78 @@ window.__ModuleLoader__.load({
 			return body;
 		}
 
+		// ── remembered view state ───────────────────────────────────────────
+		/**
+		 * Where the panel stores which sections the user opened or closed.
+		 *
+		 * A namespaced `localStorage` key, read and written defensively, is the
+		 * pattern the built-in client plugins use for view state
+		 * (ui-sidebar-right stores its layout the same way): it survives a
+		 * reload and a restart without a Host round trip, and a browser that
+		 * blocks storage just means the panel forgets, never that it breaks.
+		 */
+		const VIEW_STATE_KEY = 'dsh-toolbox:view-state'
+
+		function emptyViewState() {
+			return { groups: {}, orphans: false }
+		}
+
+		/**
+		 * Read the remembered choices.
+		 *
+		 * Only explicit booleans are kept. Anything else — a truncated write, a
+		 * hand-edited value, a schema from a future version — is dropped rather
+		 * than trusted, so one bad entry cannot wedge the panel.
+		 */
+		function loadViewState() {
+			try {
+				const raw = window.localStorage.getItem(VIEW_STATE_KEY)
+				if (raw === null) return emptyViewState()
+				const parsed = JSON.parse(raw)
+				if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return emptyViewState()
+				const state = emptyViewState()
+				const groups = parsed.groups
+				if (groups !== null && typeof groups === 'object' && !Array.isArray(groups)) {
+					for (const [key, value] of Object.entries(groups)) {
+						if (typeof value === 'boolean') state.groups[key] = value
+					}
+				}
+				state.orphans = parsed.orphans === true
+				return state
+			} catch {
+				return emptyViewState()
+			}
+		}
+
+		function saveViewState(state) {
+			try {
+				window.localStorage.setItem(VIEW_STATE_KEY, JSON.stringify(state))
+			} catch {
+				// Storage disabled or full: remembered choices are a convenience,
+				// so failing to write one is not a reason to disturb the panel.
+			}
+		}
+
+		/** Whether any session in this group — parent or child — is running. */
+		function groupHasRunning(group) {
+			return group.sessions.some((row) => row.running === true
+				|| (Array.isArray(row.subagents) && row.subagents.some((child) => child.running === true)))
+		}
+
+		/**
+		 * Resolve one group's expansion.
+		 *
+		 * An explicit choice always wins. Without one, a group holding a running
+		 * session starts open so the user can see the work, and every other
+		 * group starts closed — with many workspaces, an all-open list buries
+		 * the thing that is actually happening.
+		 */
+		function resolveGroupOpen(choices, key, group) {
+			const chosen = choices[key]
+			if (typeof chosen === 'boolean') return chosen
+			return groupHasRunning(group)
+		}
+
 		// ── one row ─────────────────────────────────────────────────────────
 		function SessionRow(props) {
 			const { row, s, busy, mode, onDelete, onRestore, onPurge, isChild } = props;
@@ -243,7 +361,6 @@ window.__ModuleLoader__.load({
 			meta.push(row.cwd || s.noCwd);
 			const size = formatBytes(row.sizeBytes);
 			meta.push(size === null ? s.sizeUnknown : size);
-			if (typeof row.eventCount === 'number') meta.push(s.msgs(row.eventCount));
 			if (mode === 'trash' && row.deletedAt) meta.push(formatTime(row.deletedAt));
 
 			const tags = [];
@@ -304,18 +421,36 @@ window.__ModuleLoader__.load({
 			const [state, setState] = React.useState(null);
 			const [error, setError] = React.useState(null);
 			const [busyId, setBusyId] = React.useState(null);
-			const [collapsed, setCollapsed] = React.useState({});
-			const [orphanOpen, setOrphanOpen] = React.useState(false);
+			// Explicit open/closed choices, loaded once from storage so a reload
+			// and a restart both restore what the user last did.
+			const [view, setView] = React.useState(loadViewState);
+			const groupOpen = view.groups;
+			const orphanOpen = view.orphans;
 			const [tick, setTick] = React.useState(0);
+			// The in-flight read, shared by the poll and every manual refresh.
+			const inFlight = React.useRef(null);
+			// What the spinner reflects: a read the user asked for by hand, so a
+			// background poll never flickers the button.
+			const [manualLoading, setManualLoading] = React.useState(false);
 
 			const reload = React.useCallback(async () => {
-				try {
-					const next = await fetchState();
-					setState(next);
-					setError(null);
-				} catch (failure) {
-					setError(failure instanceof Error ? failure.message : 'state-failed');
-				}
+				// One read at a time: the 5s poll and a manual refresh can overlap,
+				// and on a slow disk the older response could land last and paint
+				// stale rows over fresh ones.
+				if (inFlight.current !== null) return inFlight.current;
+				const run = (async () => {
+					try {
+						const next = await fetchState();
+						setState(next);
+						setError(null);
+					} catch (failure) {
+						setError(failure instanceof Error ? failure.message : 'state-failed');
+					} finally {
+						inFlight.current = null;
+					}
+				})();
+				inFlight.current = run;
+				return run;
 			}, []);
 
 			React.useEffect(() => {
@@ -328,6 +463,51 @@ window.__ModuleLoader__.load({
 				}, 5000);
 				return () => window.clearInterval(timer);
 			}, [reload]);
+
+			// Persist the choices, bounded to the groups that still exist.
+			// Writing before the first read lands would erase the remembered map
+			// (there are no groups yet), so the state-null case is skipped.
+			React.useEffect(() => {
+				if (state === null) return;
+				const live = new Set(state.groups.map((group) => group.workspaceId || '__ungrouped__'));
+				const groups = {};
+				for (const [key, value] of Object.entries(groupOpen)) {
+					if (live.has(key)) groups[key] = value;
+				}
+				saveViewState({ groups, orphans: orphanOpen });
+			}, [groupOpen, orphanOpen, state]);
+
+			/**
+			 * The refresh button: wait for the current read, then read again.
+			 *
+			 * `reload()` collapses overlapping calls into the in-flight one, which
+			 * would swallow a click that lands mid-poll — the user would see the
+			 * pre-click data and believe the button did nothing. Awaiting the
+			 * in-flight read first means every click ends in a read that started
+			 * after it, and rapid clicks share one follow-up instead of stacking.
+			 */
+			const requestRefresh = React.useCallback(async () => {
+				if (manualLoading) return;
+				setManualLoading(true);
+				// Hold the spinner for at least MIN_SPIN_MS: a local read settles in
+				// a few milliseconds, and a flash of motion reads as a glitch
+				// rather than as feedback. The remaining time is measured from the
+				// click, so the total is `max(MIN_SPIN_MS, request time)` — a slow
+				// read is shown for exactly as long as it takes, never padded twice.
+				const startedAt = Date.now();
+				try {
+					if (inFlight.current !== null) await inFlight.current;
+					await reload();
+				} finally {
+					const remaining = MIN_SPIN_MS - (Date.now() - startedAt);
+					if (remaining > 0) {
+						await new Promise((resolve) => {
+							window.setTimeout(resolve, remaining);
+						});
+					}
+					setManualLoading(false);
+				}
+			}, [manualLoading, reload]);
 
 			const withBusy = async (sessionId, run) => {
 				setBusyId(sessionId);
@@ -349,7 +529,12 @@ window.__ModuleLoader__.load({
 			const totalBytes = state === null ? 0 : state.totalBytes;
 			const sessionCount = groups.reduce((sum, group) => sum + group.sessions.length, 0);
 
-			const toggle = (key) => setCollapsed((prev) => ({ ...prev, [key]: prev[key] !== true }));
+			const toggle = (key, group) => {
+				setView((prev) => ({
+					...prev,
+					groups: { ...prev.groups, [key]: !resolveGroupOpen(prev.groups, key, group) },
+				}));
+			};
 
 			const askDelete = (row) => {
 				if (!window.confirm(s.confirmDelete(row.title || s.unknownTitle))) return;
@@ -375,7 +560,7 @@ window.__ModuleLoader__.load({
 
 			const renderGroup = (group, index) => {
 				const key = group.workspaceId || '__ungrouped__';
-				const isOpen = collapsed[key] !== true;
+				const isOpen = resolveGroupOpen(groupOpen, key, group);
 				const label = group.title === null ? s.ungrouped : group.title;
 				const rows = [];
 				for (const row of group.sessions) {
@@ -387,7 +572,7 @@ window.__ModuleLoader__.load({
 						type: 'button',
 						className: 'dsh-toolbox__groupHead',
 						'aria-expanded': isOpen ? 'true' : 'false',
-						onClick: () => toggle(key),
+						onClick: () => toggle(key, group),
 					},
 						h('span', { className: 'dsh-toolbox__chevron', 'aria-hidden': 'true' }, CHEVRON),
 						h('span', { className: 'dsh-toolbox__groupText' },
@@ -430,9 +615,22 @@ window.__ModuleLoader__.load({
 						),
 						h('button', {
 							type: 'button',
-							className: 'dsh-toolbox__btn dsh-toolbox__sectionAction',
-							onClick: () => setTick((n) => n + 1),
-						}, s.refresh),
+							className: manualLoading
+								? 'dsh-toolbox__btn dsh-toolbox__btn--refresh dsh-toolbox__btn--busy dsh-toolbox__sectionAction'
+								: 'dsh-toolbox__btn dsh-toolbox__btn--refresh dsh-toolbox__sectionAction',
+							disabled: manualLoading,
+							// The visible label is hidden (not removed) while loading,
+							// which takes its text out of the accessibility tree; the
+							// explicit name keeps the button announced in both states.
+							'aria-label': s.refresh,
+							'aria-busy': manualLoading ? 'true' : 'false',
+							onClick: requestRefresh,
+						},
+							h('span', { className: 'dsh-toolbox__label' }, s.refresh),
+							manualLoading
+								? h('span', { className: 'dsh-toolbox__spinnerLayer' }, SPINNER)
+								: null,
+						),
 					),
 					groups.length === 0
 						? h('div', { className: 'dsh-toolbox__empty' }, state === null ? s.loading : s.empty)
@@ -448,7 +646,7 @@ window.__ModuleLoader__.load({
 							type: 'button',
 							className: 'dsh-toolbox__btn dsh-toolbox__sectionAction',
 							'aria-expanded': orphanOpen ? 'true' : 'false',
-							onClick: () => setOrphanOpen((open) => !open),
+							onClick: () => setView((prev) => ({ ...prev, orphans: !prev.orphans })),
 						}, s.orphanGroup(orphans.length)),
 					),
 					orphans.length === 0 ? null : (orphanOpen
