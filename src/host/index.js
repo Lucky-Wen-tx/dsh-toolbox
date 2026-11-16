@@ -2,20 +2,35 @@
  * dsh-toolbox — session cleanup (host row `dsh-toolbox-sessions`).
  *
  * What this row owns:
- *   - the trash on disk (`<DSH_HOME>/dsh-toolbox/trash/<sessionId>/`)
- *   - the trash index (`<DSH_HOME>/dsh-toolbox/trash.json`)
- *   - the HTTP routes the client half calls
+ *   - the archive toggle the panel offers (`workspaceRegistry.archiveSession` /
+ *     `unarchiveSession` — the same public calls the sidebar's own menu uses)
+ *   - permanent destruction: a session's log directory, its projection cache,
+ *     and every registry entry that still names it
+ *   - the one-time retirement of the `delete → trash → restore` model of
+ *     earlier versions, and of the dead archive flags that model left behind
  *
  * What it deliberately does NOT own:
- *   - session logs themselves (they belong to `sessionPersistence`)
- *   - the archive flag (that belongs to `workspaceRegistry`; we call its
- *     public `archiveSession` / `unarchiveSession`)
- *   - workspace accounting (we call `Workspace.detachSession` on purge)
- *   - the meaning of "running" (we read `sessionController.list()`, the same
- *     source the sidebar uses: `running`, `blank`, `agentAvailable`, `origin`)
+ *   - the archive flag's storage (that belongs to `workspaceRegistry`; this row
+ *     only calls its public methods)
+ *   - session logs themselves (they belong to `sessionPersistence`; this row
+ *     deletes them on request and never stages a copy)
+ *   - workspace accounting (we call `Workspace.detachSession`)
+ *   - the meaning of "running" or "held open" (we read `sessionController.list()`,
+ *     the same source the sidebar uses)
  *
- * Grouping follows the official rule (ui-workspace `groupByWorkspace`):
- * a session belongs to the workspace whose `sessionIds` lists it; anything
+ * Archiving is required before destruction: it is the reversible step, so the
+ * irreversible click is never the first one. A session this process still holds
+ * open is refused as well — its agent may still be writing the log, and the
+ * Host keeps listing a live session from memory after the files are gone, which
+ * would make "destroyed" mean anything but gone.
+ *
+ * Destruction is meant to leave nothing behind. It removes the log directory
+ * (with everything inside it), the projection-cache record, the workspace
+ * membership slot, the pin and the archive flag, so neither the panel, the
+ * sidebar, nor `storages/workspace.json` can be made to name the session again.
+ *
+ * Grouping follows the official rule (ui-workspace `groupByWorkspace`): a
+ * session belongs to the workspace whose `sessionIds` lists it; anything
  * unlisted falls into the Ungrouped bucket. Subagent children never render as
  * ordinary rows — they nest under their parent, and a child whose parent is
  * gone is reported separately so it can be cleaned up.
@@ -23,7 +38,7 @@
  * Everything here is plain ESM with zero `@deepseek-ai/*` imports, so the
  * package installs and loads without a build step.
  */
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, rmdir } from 'node:fs/promises'
 import { existsSync, readdirSync } from 'node:fs'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
@@ -34,11 +49,10 @@ export const inject = []
 
 const ROUTE_PREFIX = '/dsh-toolbox'
 const MAX_BODY_BYTES = 64 * 1024
-const TRASH_LIMIT = 20
 /**
  * Session ids are joined into a path, so keep the charset tight. A bare `.`
  * or `..` is rejected separately: both match this charset but resolve to a
- * parent directory, so `trashDir()` would point at the trash root itself.
+ * parent directory, so a delete would target the wrong directory.
  */
 const SESSION_ID_RE = /^[A-Za-z0-9_.:-]+$/
 const DOT_SEGMENT_RE = /^\.+$/
@@ -48,28 +62,49 @@ const DOT_SEGMENT_RE = /^\.+$/
 function dshHome() {
   return process.env.DSH_HOME || join(homedir(), '.dsh')
 }
-function toolboxRoot() {
-  return join(dshHome(), 'dsh-toolbox')
-}
-function trashRoot() {
-  return join(toolboxRoot(), 'trash')
-}
-function trashDir(sessionId) {
-  return join(trashRoot(), sessionId)
-}
-function indexFile() {
-  return join(toolboxRoot(), 'trash.json')
-}
 function sessionsRoot() {
   return join(dshHome(), 'sessions')
 }
 /**
- * The projection cache keeps one small JSON file per session. Purging a
- * session without it leaves an orphan record behind (a real complaint against
+ * The projection cache keeps one record per session. Destroying a session
+ * without it leaves an orphan record behind (a real complaint against
  * comparable plugins), so purge removes it too.
+ *
+ * The directory and the record's file name are the shipped json backend's
+ * `per-record` layout; the supported way to remove a record is the storage
+ * domain's table (see `dropProjectionRecord`). These paths are the fallback
+ * for a build where that domain is not open, and for the `.bak` copies the
+ * cache leaves behind when it refuses a stored record.
  */
+function projectionCacheDir() {
+  return join(dshHome(), 'storages', 'session_projcache', 'sessions')
+}
 function projectionCacheFile(sessionId) {
-  return join(dshHome(), 'storages', 'session_projcache', 'sessions', `${sessionId}.json`)
+  return join(projectionCacheDir(), `${sessionId}.json`)
+}
+/**
+ * The `<key>.json.bak.<stamp>` copies the cache moves a rejected record to.
+ * The backend names a per-record document by its raw key, so the prefix is the
+ * session id itself — no path encoding is involved.
+ */
+function projectionCacheBackups(sessionId) {
+  const dir = projectionCacheDir()
+  if (!existsSync(dir)) return []
+  const prefix = `${sessionId}.json.bak.`
+  try {
+    return readdirSync(dir)
+      .filter((name) => name.startsWith(prefix))
+      .map((name) => join(dir, name))
+  } catch {
+    return []
+  }
+}
+/** Where versions before 0.2 kept deleted logs, until the upgrade retires it. */
+function legacyTrashRoot() {
+  return join(dshHome(), 'dsh-toolbox', 'trash')
+}
+function legacyTrashIndex() {
+  return join(dshHome(), 'dsh-toolbox', 'trash.json')
 }
 
 /**
@@ -77,9 +112,9 @@ function projectionCacheFile(sessionId) {
  * it: `[A-Za-z0-9._-]` survives, everything else becomes `~XXXX` (uppercase,
  * 4 hex digits). `~` itself is escaped, so the mapping is injective.
  *
- * This is a copy of the backend's own rule, not a guess: the trash fallback
- * has to rebuild a session's original path without asking the backend, and a
- * near-miss here would restore files into the wrong directory.
+ * This is a copy of the backend's own rule, not a guess: a session whose
+ * snapshot is unreadable still has to be located by id alone, and a near-miss
+ * here would point a delete at the wrong directory.
  */
 function encodeSegment(raw) {
   if (raw.length === 0) throw new Error('cannot encode an empty path segment')
@@ -129,8 +164,8 @@ function projectKey(cwd) {
  * `<DSH_HOME>/sessions/<projectKey(cwd)>/<encodeSegment(id)>`.
  *
  * `undefined` when the header carries no cwd, because that layout puts the
- * session under `_no-cwd` and a restore into the wrong bucket is worse than
- * reporting that the path cannot be rebuilt.
+ * session under `_no-cwd` and guessing another bucket is worse than reporting
+ * that the path cannot be rebuilt.
  */
 function derivedSessionDir(cwd, sessionId) {
   if (typeof cwd !== 'string' || cwd === '') return undefined
@@ -204,15 +239,44 @@ function headerOf(item) {
 }
 
 /**
+ * The backend's own answer for where one session's log lives.
+ *
+ * `sessionPersistence.locate()` is `private` in the 0.2.x typings but present
+ * at runtime, and it is the only source that knows a persistence root this
+ * plugin did not derive. It is asked first and validated exactly like every
+ * other candidate: a path outside the sessions root is ignored, never deleted.
+ */
+function backendLocation(persistence, header) {
+  if (persistence === undefined || header === undefined) return undefined
+  let found
+  try {
+    found = persistence.locate?.(header)
+  } catch {
+    return undefined
+  }
+  if (found === null || typeof found !== 'object') return undefined
+  const path = found.path
+  if (typeof path !== 'string') return undefined
+  const dir = path.endsWith('.jsonl') || path.endsWith('.zstd') ? dirname(path) : path
+  return existsSync(dir) && isInsideSessionsRoot(dir) ? dir : undefined
+}
+
+/**
  * Locate one session's artifact directory.
  *
- * Preferred source is the snapshot's own `location.path`; otherwise fall back
- * to the on-disk layout `<DSH_HOME>/sessions/<projectKey(cwd)>/<encoded id>/`.
+ * Preferred sources, in order: the backend's `locate()`, the snapshot's own
+ * `location.path`, then the on-disk layout
+ * `<DSH_HOME>/sessions/<projectKey(cwd)>/<encoded id>/`.
  *
  * Every candidate must resolve inside the sessions root, so a snapshot that
- * points somewhere else cannot make the trash move an unrelated directory.
+ * points somewhere else cannot make a destroy delete an unrelated directory.
  */
-function locateSessionDir(location, sessionId, cwd) {
+function locateSessionDir(persistence, snapshot, sessionId, cwd) {
+  const header = snapshot === undefined ? undefined : headerOf(snapshot)
+  const backend = backendLocation(persistence, header)
+  if (backend !== undefined) return backend
+
+  const location = snapshot === undefined ? undefined : snapshot.location
   if (location && typeof location.path === 'string') {
     const candidate = location.path
     const dir = candidate.endsWith('.jsonl') || candidate.endsWith('.zstd') ? dirname(candidate) : candidate
@@ -242,40 +306,106 @@ function locateSessionDir(location, sessionId, cwd) {
   return undefined
 }
 
-// ── trash index ────────────────────────────────────────────────────────────
-
-async function readIndex() {
-  try {
-    const raw = await readFile(indexFile(), 'utf8')
-    const parsed = JSON.parse(raw)
-    if (parsed && Array.isArray(parsed.entries)) return parsed.entries
-  } catch {
-    // Missing or unreadable index is an empty trash, never a hard failure.
+/**
+ * Every session below `sessionId` in the subagent tree, parents before children.
+ *
+ * A child carries `parentSessionId`, so the tree is rebuilt from the same list
+ * the panel renders. The backend's own listing is folded in as well: a child
+ * the controller did not report (an unreadable or newer-format header) is
+ * still a log on disk, and leaving it behind would be a trace nobody can
+ * reach. The visited set keeps a malformed or self-referencing header from
+ * turning a destroy into an endless walk.
+ */
+function collectDescendants(items, headers, sessionId) {
+  const childrenOf = new Map()
+  const link = (id, parent) => {
+    if (parent === undefined || parent === id) return
+    const bucket = childrenOf.get(parent)
+    if (bucket === undefined) childrenOf.set(parent, [id])
+    else if (!bucket.includes(id)) bucket.push(id)
   }
-  return []
+  for (const item of items) link(item.sessionId, item.parentSessionId)
+  for (const header of headers) link(header.id, header.parentSessionId)
+  const out = []
+  const seen = new Set([sessionId])
+  const queue = [sessionId]
+  while (queue.length > 0) {
+    const current = queue.shift()
+    for (const childId of childrenOf.get(current) ?? []) {
+      if (seen.has(childId)) continue
+      seen.add(childId)
+      out.push(childId)
+      queue.push(childId)
+    }
+  }
+  return out
 }
+
+// ── upgrades from 0.1 ──────────────────────────────────────────────────────
 
 /**
- * Serialize every read-modify-write of the trash index.
+ * Versions before 0.2 deleted a session by moving its log out of the sessions
+ * root into `<DSH_HOME>/dsh-toolbox/trash/<id>/` and recording the original
+ * path in `trash.json`. That model is gone: archiving is the reversible step
+ * and this row only destroys, so a log parked in that trash can neither be
+ * opened from the sidebar nor destroyed from the panel.
  *
- * Two concurrent deletes would otherwise both read the same entries, each
- * append its own, and the second write would drop the first entry while its
- * directory stayed on disk — an entry nobody can restore or purge.
+ * The upgrade therefore puts every entry back where it came from. The session
+ * keeps its archive flag when it still has one, so it shows up in the panel as
+ * an archived card and the user decides whether to destroy it.
+ *
+ * This runs once, at apply time. It never deletes a log: when an entry has no
+ * usable original path, or a newer copy already exists there, the whole old
+ * trash tree is left untouched and reported instead.
  */
-let indexChain = Promise.resolve()
-function withIndexLock(run) {
-  const next = indexChain.then(run, run)
-  // Keep the chain alive after a rejection: a failed delete must not wedge
-  // every later one.
-  indexChain = next.then(() => undefined, () => undefined)
-  return next
-}
+async function retireLegacyTrash(logger) {
+  const index = legacyTrashIndex()
+  if (!existsSync(index)) return
 
-async function writeIndex(entries) {
-  await mkdir(toolboxRoot(), { recursive: true })
-  const tmp = `${indexFile()}.tmp`
-  await writeFile(tmp, JSON.stringify({ version: 1, entries }, null, 2), 'utf8')
-  await rename(tmp, indexFile())
+  let entries = []
+  try {
+    const parsed = JSON.parse(await readFile(index, 'utf8'))
+    if (parsed !== null && typeof parsed === 'object' && Array.isArray(parsed.entries)) entries = parsed.entries
+  } catch (error) {
+    logger.warn('[dsh-toolbox] unusable legacy trash index left in place:', error)
+    return
+  }
+
+  let stranded = 0
+  for (const entry of entries) {
+    const id = entry !== null && typeof entry === 'object' ? entry.sessionId : undefined
+    if (typeof id !== 'string' || !SESSION_ID_RE.test(id) || DOT_SEGMENT_RE.test(id)) continue
+    const from = join(legacyTrashRoot(), id)
+    if (!existsSync(from)) continue
+    const recorded = typeof entry.originalPath === 'string' && isInsideSessionsRoot(entry.originalPath)
+      ? entry.originalPath
+      : undefined
+    const target = recorded ?? derivedSessionDir(entry.cwd, id)
+    if (target === undefined) {
+      stranded += 1
+      logger.warn(`[dsh-toolbox] legacy trash entry ${id} has no usable original path; left in place`)
+      continue
+    }
+    if (existsSync(target)) continue
+    try {
+      await mkdir(dirname(target), { recursive: true })
+      await rename(from, target)
+    } catch (error) {
+      stranded += 1
+      logger.warn(`[dsh-toolbox] could not put ${id} back into the sessions root:`, error)
+    }
+  }
+
+  if (stranded > 0) {
+    logger.warn(`[dsh-toolbox] legacy trash left at ${legacyTrashRoot()} (${stranded} stranded)`)
+    return
+  }
+  try {
+    await rm(index, { force: true })
+    await rm(legacyTrashRoot(), { recursive: true, force: true })
+  } catch (error) {
+    logger.warn('[dsh-toolbox] could not remove the retired trash:', error)
+  }
 }
 
 // ── the row ────────────────────────────────────────────────────────────────
@@ -287,22 +417,175 @@ export function apply(ctx) {
     const registry = () => scoped.get('workspaceRegistry')
     const storage = () => scoped.get('storageDomain')
 
+    /**
+     * One mutation at a time.
+     *
+     * A destroy is several steps — the log directory, the projection record,
+     * the workspace slot, the pin, the archive flag — and two destroys clicked
+     * in quick succession would otherwise interleave them. Serialising them
+     * also covers the archive toggle, so a destroy can never see a session
+     * that a concurrent unarchive just made eligible again.
+     */
+    let mutationTail = Promise.resolve()
+    const serialize = (run) => {
+      const next = mutationTail.then(run, run)
+      mutationTail = next.then(() => undefined, () => undefined)
+      return next
+    }
+
+    /**
+     * Remove one session's projection-cache record.
+     *
+     * The record is derived data owned by the `session_projcache` domain, so
+     * the domain's own table is the supported route: it updates the cache
+     * service's in-memory state as well as the medium, and it works for a
+     * backend that does not use the per-record file layout. The file is the
+     * fallback for a build where that domain is not open, and the `.bak`
+     * copies are removed either way because they are dead by definition.
+     */
+    const dropProjectionRecord = async (sessionId) => {
+      const cache = storage()?.get('session_projcache')
+      let dropped = false
+      if (cache !== undefined) {
+        try {
+          await cache.table('sessions').delete(sessionId)
+          dropped = true
+        } catch (error) {
+          scoped.logger.warn(`[dsh-toolbox] could not drop the projection record ${sessionId}:`, error)
+        }
+      }
+      if (!dropped) await rm(projectionCacheFile(sessionId), { force: true }).catch(() => {})
+      for (const backup of projectionCacheBackups(sessionId)) {
+        await rm(backup, { force: true }).catch(() => {})
+      }
+    }
+
     const archivedSet = () => {
       const domain = storage()
-      if (domain === undefined) return new Set()
-      const workspace = domain.get('workspace')
+      const workspace = domain === undefined ? undefined : domain.get('workspace')
       if (workspace === undefined) return new Set()
       const state = workspace.global.get()
       return new Set(Array.isArray(state.archivedSessionIds) ? state.archivedSessionIds : [])
     }
 
     /**
+     * An archive flag only ever gets set by archiving a session, so a flag
+     * whose session has no log and no live agent is the residue of a session
+     * destroyed by an earlier build — one that kept the flag on purpose. Drop
+     * those, so `storages/workspace.json` cannot name a session that is gone.
+     *
+     * Nothing that still exists is touched: the id set is read from the same
+     * session list the sidebar uses, and an unreadable or empty corpus leaves
+     * every flag alone.
+     */
+    const dropStaleArchiveFlags = async () => {
+      const domain = storage()
+      const workspace = domain === undefined ? undefined : domain.get('workspace')
+      if (workspace === undefined) return
+      const flags = workspace.global.get().archivedSessionIds
+      if (!Array.isArray(flags) || flags.length === 0) return
+      const control = controller()
+      if (control === undefined) return
+      const known = new Set()
+      try {
+        const result = await control.list({}, new AbortController().signal)
+        for (const item of result.items) known.add(item.sessionId)
+      } catch {
+        return
+      }
+      if (known.size === 0) return
+      for (const id of flags) {
+        if (known.has(id)) continue
+        try {
+          await registry()?.unarchiveSession(id)
+        } catch (error) {
+          scoped.logger.warn(`[dsh-toolbox] could not drop the stale archive flag ${id}:`, error)
+        }
+      }
+    }
+
+    /**
+     * Remove derived artifacts no session can reach any more: projection
+     * records whose session is gone, and project directories a destroy left
+     * empty.
+     *
+     * Both are reconstructible — a cache is rebuilt from the log, a project
+     * directory is recreated on the next materialisation — so this only ever
+     * removes leftovers. It is deliberately conservative: it runs only once
+     * the controller has answered, and an empty or failed listing proves
+     * nothing, so everything is left alone in that case.
+     */
+    const collectOrphanedArtifacts = async () => {
+      const cache = storage()?.get('session_projcache')
+      const table = cache === undefined ? undefined : cache.table('sessions')
+      if (table !== undefined && table.size > 0) {
+        const known = new Set()
+        try {
+          const result = await controller().list({}, new AbortController().signal)
+          for (const item of result.items) known.add(item.sessionId)
+        } catch {
+          return
+        }
+        if (known.size === 0) return
+        try {
+          for (const snapshot of await persistence().list()) known.add(headerOf(snapshot).id)
+        } catch {
+          return
+        }
+        const orphans = []
+        for (const id of table.keys()) {
+          if (!known.has(id)) orphans.push(id)
+        }
+        if (orphans.length > 0) {
+          const removed = await table.deleteMany(orphans)
+          scoped.logger.info(`[dsh-toolbox] dropped ${removed} orphaned projection record(s)`)
+        }
+      }
+
+      const root = sessionsRoot()
+      if (!existsSync(root)) return
+      for (const entry of readdirSync(root, { withFileTypes: true })) {
+        // `_no-cwd` is a shared bucket, not one project's directory.
+        if (!entry.isDirectory() || entry.name === '_no-cwd') continue
+        const dir = join(root, entry.name)
+        try {
+          if (readdirSync(dir).length === 0) await rmdir(dir)
+        } catch {
+          // Not empty, already gone, or in use: leave it for the next start.
+        }
+      }
+    }
+
+    let gcAttempted = false
+    const runGcOnce = async () => {
+      if (gcAttempted) return
+      // Wait for everything the sweep inspects. A missing projection-cache
+      // domain means the sweep would only prune empty directories while
+      // pretending the cache was clean, so it is retried by the next read.
+      if (controller() === undefined || storage() === undefined) return
+      if (storage().get('session_projcache') === undefined) return
+      gcAttempted = true
+      await serialize(collectOrphanedArtifacts)
+    }
+
+    // The upgrades and the orphan sweep run once, off the request path.
+    void retireLegacyTrash(scoped.logger).catch((error) => {
+      scoped.logger.warn('[dsh-toolbox] legacy trash retirement failed:', error)
+    })
+    void dropStaleArchiveFlags().catch((error) => {
+      scoped.logger.warn('[dsh-toolbox] stale archive cleanup failed:', error)
+    })
+    void runGcOnce().catch((error) => {
+      scoped.logger.warn('[dsh-toolbox] orphan cleanup failed:', error)
+    })
+
+    /**
      * Build the full session view.
      *
      * `sessionController.list()` is the authoritative row source: it reports
      * `running`, `blank`, `agentAvailable` and `origin` without resuming an
-     * agent. `sessionPersistence.list()` adds on-disk size and the location
-     * the trash needs. Neither is used for grouping — that comes from
+     * agent. `sessionPersistence.list()` adds on-disk size and the location a
+     * destroy needs. Neither is used for grouping — that comes from
      * `workspaceRegistry.list()`.
      */
     const buildView = async () => {
@@ -322,15 +605,24 @@ export function apply(ctx) {
       }
 
       const archived = archivedSet()
-      const rows = listResult.items.map((summary) => {
+      const rows = []
+      for (const summary of listResult.items) {
         const id = summary.sessionId
         const snapshot = disk.get(id)
         const header = snapshot === undefined ? undefined : headerOf(snapshot)
+        const cwd = summary.cwd ?? header?.cwd
+        const dir = locateSessionDir(persistence(), snapshot, id, cwd)
+        // Neither a persistence snapshot nor a locateable directory: every
+        // artifact of this session is already gone, and only an in-memory agent
+        // still remembers it — the leftover of a destroy, for one. Such a row
+        // has no size and no path, so it can only be noise in a list meant for
+        // deciding what to clean up.
+        if (snapshot === undefined && dir === undefined) continue
         const title = summary.projections?.values?.title
-        return {
+        rows.push({
           id,
           title: typeof title === 'string' && title.trim() !== '' ? title : undefined,
-          cwd: summary.cwd ?? header?.cwd,
+          cwd,
           createdAt: header?.createdAt,
           updatedAt: summary.updatedAt,
           parentSessionId: summary.parentSessionId,
@@ -342,10 +634,10 @@ export function apply(ctx) {
           formatStatus: summary.formatStatus,
           archived: archived.has(id),
           sizeBytes: snapshot?.sizeBytes,
-          dir: locateSessionDir(snapshot?.location, id, summary.cwd ?? header?.cwd),
+          dir,
           subagents: [],
-        }
-      })
+        })
+      }
 
       const byId = new Map(rows.map((row) => [row.id, row]))
 
@@ -362,7 +654,9 @@ export function apply(ctx) {
       const ordinary = rows.filter((row) => !row.isSubagent)
 
       // Official grouping: workspace.sessionIds first, then everything left
-      // over becomes the Ungrouped bucket.
+      // over becomes the Ungrouped bucket. Archived sessions keep their slot —
+      // the panel shows them in place, with the archive toggle and the destroy
+      // button.
       const workspaces = registry() === undefined ? [] : registry().list()
       const accounted = new Set()
       const groups = []
@@ -400,11 +694,34 @@ export function apply(ctx) {
       return result.items.find((item) => item.sessionId === sessionId)
     }
 
-    // GET /dsh-toolbox/state — grouped sessions + trash, one round trip.
+    /** Read one body and hand back a validated id, or answer the error itself. */
+    const readId = async (req, res) => {
+      if (req.method !== 'POST') {
+        respond(res, 405, { ok: false, error: 'method-not-allowed' })
+        return undefined
+      }
+      let body
+      try {
+        body = await readJsonBody(req)
+      } catch {
+        respond(res, 400, { ok: false, error: 'bad-request' })
+        return undefined
+      }
+      const id = parseSessionId(body)
+      if (id === undefined) respond(res, 400, { ok: false, error: 'invalid-session-id' })
+      return id
+    }
+
+    // GET /dsh-toolbox/state — grouped sessions + orphans, one round trip.
     scoped.webServer.register({
       kind: 'exact',
       path: `${ROUTE_PREFIX}/state`,
       handler: async (_req, res) => {
+        // The orphan sweep is deferred to the first read when the services
+        // were not ready at apply time; it is idempotent and runs once.
+        void runGcOnce().catch((error) => {
+          scoped.logger.warn('[dsh-toolbox] orphan cleanup failed:', error)
+        })
         try {
           const view = await buildView()
           respond(res, 200, {
@@ -412,8 +729,6 @@ export function apply(ctx) {
             groups: view.groups,
             orphans: view.orphans,
             totalBytes: view.totalBytes,
-            entries: await readIndex(),
-            limit: TRASH_LIMIT,
             sessionsRoot: sessionsRoot(),
           })
         } catch (error) {
@@ -423,250 +738,192 @@ export function apply(ctx) {
       },
     })
 
-    // GET /dsh-toolbox/trash
-    scoped.webServer.register({
-      kind: 'exact',
-      path: `${ROUTE_PREFIX}/trash`,
-      handler: async (_req, res) => {
-        try {
-          respond(res, 200, { ok: true, entries: await readIndex(), limit: TRASH_LIMIT })
-        } catch (error) {
-          scoped.logger.warn('[dsh-toolbox] trash read failed:', error)
-          respond(res, 500, { ok: false, error: 'trash-read-failed' })
-        }
-      },
-    })
+    // ── mutations ──────────────────────────────────────────────────────────
+    //
+    // Every route below runs through `serialize`, so two clicks land one after
+    // the other instead of interleaving their steps.
 
-    // POST /dsh-toolbox/delete — archive + move the artifact into the trash.
+    // The reversible step, from the panel.
+    const archiveSession = async (sessionId, res) => {
+      try {
+        const summary = await findSummary(sessionId)
+        if (summary !== undefined && summary.running === true) {
+          return respond(res, 409, { ok: false, error: 'session-running' })
+        }
+        if (registry() === undefined) return respond(res, 503, { ok: false, error: 'registry-unavailable' })
+        await registry().archiveSession(sessionId)
+        respond(res, 200, { ok: true })
+      } catch (error) {
+        scoped.logger.warn('[dsh-toolbox] archive failed:', error)
+        respond(res, 500, { ok: false, error: 'archive-failed' })
+      }
+    }
+
+    // Undo it.
+    const unarchiveSession = async (sessionId, res) => {
+      try {
+        if (registry() === undefined) return respond(res, 503, { ok: false, error: 'registry-unavailable' })
+        await registry().unarchiveSession(sessionId)
+        respond(res, 200, { ok: true })
+      } catch (error) {
+        scoped.logger.warn('[dsh-toolbox] unarchive failed:', error)
+        respond(res, 500, { ok: false, error: 'unarchive-failed' })
+      }
+    }
+
+    // Permanent, and meant to leave nothing behind.
+    //
+    // Only an archived session may be destroyed: archiving is the reversible
+    // step, so the irreversible click can never be the first one. Subagent
+    // children are exempt — they never appear in the sidebar, so they can never
+    // be archived, and they are exactly what the orphan bucket is for.
+    //
+    // Destroying a session takes its whole subagent subtree with it. A child log
+    // is a sibling directory, it can never be opened without its parent, and
+    // the sidebar never shows subagent-origin rows — so leaving it behind would
+    // be a trace nobody could reach, only one the orphan bucket could find.
+    const purgeSession = async (sessionId, res) => {
+      try {
+        const control = controller()
+        const items = control === undefined
+          ? []
+          : (await control.list({}, new AbortController().signal)).items
+        const summary = items.find((item) => item.sessionId === sessionId)
+
+        const snapshots = persistence() === undefined ? [] : await persistence().list()
+        const snapshotById = new Map()
+        for (const snapshot of snapshots) snapshotById.set(headerOf(snapshot).id, snapshot)
+
+        const targets = [sessionId, ...collectDescendants(items, snapshots.map(headerOf), sessionId)]
+
+        // Refuse the whole subtree when any part of it is busy: a destroy that
+        // half-completes would leave exactly the kind of trace this route is
+        // supposed to avoid.
+        const liveStore = scoped.get('sessions')
+        for (const targetId of targets) {
+          const item = items.find((entry) => entry.sessionId === targetId)
+          if (item === undefined) continue
+          if (item.running === true) return respond(res, 409, { ok: false, error: 'session-running' })
+          if (item.agentAvailable === true) return respond(res, 409, { ok: false, error: 'session-in-use' })
+          // A live session can sit in the store without an agent (retained, or
+          // prepared and not yet announced). The Host would keep listing it
+          // after the files are gone, so it is refused the same way.
+          let live
+          try {
+            live = liveStore === undefined ? undefined : liveStore.get(targetId)
+          } catch {
+            live = undefined
+          }
+          if (live !== undefined) return respond(res, 409, { ok: false, error: 'session-in-use' })
+        }
+
+        const snapshot = snapshotById.get(sessionId)
+        const header = snapshot === undefined ? undefined : headerOf(snapshot)
+        if (summary === undefined && snapshot === undefined) {
+          return respond(res, 404, { ok: false, error: 'session-not-found' })
+        }
+
+        const isSubagent = summary?.origin === 'subagent' || header?.origin === 'subagent'
+        if (!isSubagent && !archivedSet().has(sessionId)) {
+          return respond(res, 409, { ok: false, error: 'session-not-archived' })
+        }
+
+        // 0) Preflight. Resolve every artifact directory before deleting
+        //    anything. A snapshot without a locatable directory means the
+        //    backend knows a log this build cannot find — a moved root, a newer
+        //    layout. Reporting success there would clear the registry while
+        //    leaving the log on disk for nobody to reach, so it refuses the
+        //    whole subtree instead. A target with no snapshot has no log at all
+        //    (a blank session, or the residue of an earlier destroy).
+        const plans = []
+        for (const targetId of targets) {
+          const targetSnapshot = snapshotById.get(targetId)
+          const targetHeader = targetSnapshot === undefined ? undefined : headerOf(targetSnapshot)
+          const dir = locateSessionDir(
+            persistence(),
+            targetSnapshot,
+            targetId,
+            targetHeader?.cwd ?? summary?.cwd ?? header?.cwd,
+          )
+          if (dir === undefined) {
+            if (targetSnapshot !== undefined) {
+              scoped.logger.warn(`[dsh-toolbox] ${targetId}: no locatable log directory; refusing the destroy`)
+              return respond(res, 409, { ok: false, error: 'artifact-not-located' })
+            }
+            continue
+          }
+          plans.push({ id: targetId, dir })
+        }
+
+        // 1) The log directories, with everything inside them.
+        for (const plan of plans) await rm(plan.dir, { recursive: true, force: true })
+
+        // 2) The projection-cache records that live outside the log directories.
+        for (const targetId of targets) await dropProjectionRecord(targetId)
+
+        // 3) Every registry entry that names the session. Removing these is
+        //    what keeps the sidebar's pin/archive sets and the Ungrouped
+        //    bucket from remembering it, and it is what makes the archive
+        //    flag itself disappear.
+        let detached = true
+        try {
+          for (const workspace of registry()?.list() ?? []) {
+            for (const targetId of targets) {
+              if (workspace.sessionIds.includes(targetId)) await workspace.detachSession(targetId)
+            }
+          }
+        } catch (error) {
+          detached = false
+          scoped.logger.warn('[dsh-toolbox] detach failed:', error)
+        }
+        try {
+          for (const targetId of targets) await registry()?.unpinSession(targetId)
+          // Unarchiving is only safe once the session has no workspace slot:
+          // otherwise it would come back as an empty "Ungrouped" row.
+          if (detached) {
+            for (const targetId of targets) await registry()?.unarchiveSession(targetId)
+          }
+        } catch (error) {
+          scoped.logger.warn('[dsh-toolbox] registry cleanup failed:', error)
+        }
+
+        respond(res, 200, { ok: true, removed: targets.length, directories: plans.length })
+      } catch (error) {
+        scoped.logger.warn('[dsh-toolbox] purge failed:', error)
+        respond(res, 500, { ok: false, error: 'purge-failed' })
+      }
+    }
+
+    // POST /dsh-toolbox/archive — hide a session in the sidebar, files intact.
     scoped.webServer.register({
       kind: 'exact',
-      path: `${ROUTE_PREFIX}/delete`,
+      path: `${ROUTE_PREFIX}/archive`,
       handler: async (req, res) => {
-        if (req.method !== 'POST') return respond(res, 405, { ok: false, error: 'method-not-allowed' })
-        let body
-        try {
-          body = await readJsonBody(req)
-        } catch {
-          return respond(res, 400, { ok: false, error: 'bad-request' })
-        }
-        const id = parseSessionId(body)
-        if (id === undefined) return respond(res, 400, { ok: false, error: 'invalid-session-id' })
-
-        try {
-          // Only a session actually executing a turn is refused. An idle agent
-          // that merely lives in memory is fine to delete; its in-memory entry
-          // is dropped when the process restarts.
-          const summary = await findSummary(id)
-          if (summary !== undefined && summary.running === true) {
-            return respond(res, 409, { ok: false, error: 'session-running' })
-          }
-
-          const snapshot = persistence() === undefined
-            ? undefined
-            : (await persistence().list()).find((item) => headerOf(item).id === id)
-          const header = snapshot === undefined ? undefined : headerOf(snapshot)
-          if (summary === undefined && snapshot === undefined) {
-            return respond(res, 404, { ok: false, error: 'session-not-found' })
-          }
-
-          const dir = locateSessionDir(snapshot?.location, id, summary?.cwd ?? header?.cwd)
-          const archiveNeeded = summary === undefined || summary.origin !== 'subagent'
-
-          // 1) Hide it from every client first: the official archive call is
-          //    public, reversible, and independent of the file move. Subagent
-          //    children have no workspace accounting, so archiving is skipped
-          //    for them rather than throwing.
-          if (archiveNeeded) await registry()?.archiveSession(id)
-
-          // 2) Move the artifact. A session with no directory (already gone,
-          //    or never materialized) still gets an index entry so Restore can
-          //    undo the archive.
-          let moved = false
-          if (dir !== undefined) {
-            try {
-              await mkdir(trashRoot(), { recursive: true })
-              await rm(trashDir(id), { recursive: true, force: true })
-              await rename(dir, trashDir(id))
-              moved = true
-            } catch (error) {
-              // Archiving already hid the session, so a failed move would
-              // leave it invisible yet on disk and absent from the trash.
-              // Put the archive back and fail the whole delete instead.
-              if (archiveNeeded) await registry()?.unarchiveSession(id).catch(() => {})
-              throw error
-            }
-          }
-
-          // 3) Record it, evicting the oldest entries past the cap. The index
-          //    is the only place a restore learns the original path from, so
-          //    every read-modify-write runs under one lock.
-          const overflow = await withIndexLock(async () => {
-            const entries = await readIndex()
-            const existing = entries.find((entry) => entry.sessionId === id)
-            const next = existing !== undefined
-              ? entries.map((entry) => (entry.sessionId === id ? { ...entry, deletedAt: Date.now() } : entry))
-              : [...entries, {
-                  sessionId: id,
-                  title: typeof body.title === 'string' ? body.title : undefined,
-                  cwd: summary?.cwd ?? header?.cwd,
-                  originalPath: dir,
-                  isSubagent: summary?.origin === 'subagent',
-                  moved,
-                  deletedAt: Date.now(),
-                }]
-            const dropped = next.length > TRASH_LIMIT ? next.slice(0, next.length - TRASH_LIMIT) : []
-            // Drop the directories BEFORE the index stops naming them: a
-            // failure here leaves an entry that a later delete can still
-            // evict, never a directory no entry points at.
-            for (const entry of dropped) {
-              await rm(trashDir(entry.sessionId), { recursive: true, force: true }).catch(() => {})
-            }
-            await writeIndex(next.slice(-TRASH_LIMIT))
-            return dropped
-          })
-
-          respond(res, 200, { ok: true, evicted: overflow.length })
-        } catch (error) {
-          scoped.logger.warn('[dsh-toolbox] delete failed:', error)
-          respond(res, 500, { ok: false, error: 'delete-failed' })
-        }
+        const id = await readId(req, res)
+        if (id === undefined) return
+        await serialize(() => archiveSession(id, res))
       },
     })
 
-    // POST /dsh-toolbox/restore — put the artifact back and un-archive.
+    // POST /dsh-toolbox/unarchive — undo it.
     scoped.webServer.register({
       kind: 'exact',
-      path: `${ROUTE_PREFIX}/restore`,
+      path: `${ROUTE_PREFIX}/unarchive`,
       handler: async (req, res) => {
-        if (req.method !== 'POST') return respond(res, 405, { ok: false, error: 'method-not-allowed' })
-        let body
-        try {
-          body = await readJsonBody(req)
-        } catch {
-          return respond(res, 400, { ok: false, error: 'bad-request' })
-        }
-        const id = parseSessionId(body)
-        if (id === undefined) return respond(res, 400, { ok: false, error: 'invalid-session-id' })
-
-        try {
-          const entry = await withIndexLock(async () => {
-            const entries = await readIndex()
-            const found = entries.find((candidate) => candidate.sessionId === id)
-            if (found === undefined) return undefined
-
-            // The recorded path is a hint, not authority: it may predate a
-            // layout change, point outside the sessions root, or be stale
-            // after an earlier partial restore. Trust it only while it is a
-            // real session directory under the root; otherwise rebuild it from
-            // the header, so a session is never lost because one field went bad.
-            const derived = derivedSessionDir(found.cwd, id)
-            const recorded = typeof found.originalPath === 'string'
-              && isInsideSessionsRoot(found.originalPath)
-              && existsSync(found.originalPath)
-              ? found.originalPath
-              : undefined
-            // Prefer the derived path when the recorded one is a different
-            // shape: the backend's own layout is the one it will look in.
-            const target = derived !== undefined && (recorded === undefined || recorded !== derived)
-              ? derived
-              : recorded ?? derived
-
-            const from = trashDir(id)
-            if (existsSync(from)) {
-              if (target === undefined) {
-                // Nothing to restore into: keep the entry and report it
-                // rather than deleting the only copy of the log.
-                return { error: 'restore-path-unknown' }
-              }
-              if (existsSync(target)) {
-                // Something recreated the original location: the newer copy wins.
-                await rm(from, { recursive: true, force: true })
-              } else {
-                await mkdir(dirname(target), { recursive: true })
-                await rename(from, target)
-              }
-            }
-
-            if (found.isSubagent !== true) {
-              await registry()?.unarchiveSession(id)
-            }
-            await writeIndex(entries.filter((candidate) => candidate.sessionId !== id))
-            return { entry: found, target }
-          })
-
-          if (entry === undefined) return respond(res, 404, { ok: false, error: 'trash-entry-not-found' })
-          if (entry.error !== undefined) return respond(res, 409, { ok: false, error: entry.error })
-          respond(res, 200, { ok: true, restoredTo: entry.target })
-        } catch (error) {
-          scoped.logger.warn('[dsh-toolbox] restore failed:', error)
-          respond(res, 500, { ok: false, error: 'restore-failed' })
-        }
+        const id = await readId(req, res)
+        if (id === undefined) return
+        await serialize(() => unarchiveSession(id, res))
       },
     })
 
-    // POST /dsh-toolbox/purge — permanent: trash copy, log, cache, accounting.
+    // POST /dsh-toolbox/purge — permanent removal of one archived session.
     scoped.webServer.register({
       kind: 'exact',
       path: `${ROUTE_PREFIX}/purge`,
       handler: async (req, res) => {
-        if (req.method !== 'POST') return respond(res, 405, { ok: false, error: 'method-not-allowed' })
-        let body
-        try {
-          body = await readJsonBody(req)
-        } catch {
-          return respond(res, 400, { ok: false, error: 'bad-request' })
-        }
-        const id = parseSessionId(body)
-        if (id === undefined) return respond(res, 400, { ok: false, error: 'invalid-session-id' })
-
-        try {
-          const summary = await findSummary(id)
-          if (summary !== undefined && summary.running === true) {
-            return respond(res, 409, { ok: false, error: 'session-running' })
-          }
-
-          const purged = await withIndexLock(async () => {
-            const entries = await readIndex()
-            const found = entries.find((candidate) => candidate.sessionId === id)
-            if (found === undefined) return undefined
-
-            await rm(trashDir(id), { recursive: true, force: true })
-            // Never delete a recorded path that escapes the sessions root: the
-            // index is user-editable text, and a corrupted field must not turn
-            // "purge one session" into "delete an unrelated directory".
-            if (typeof found.originalPath === 'string' && isInsideSessionsRoot(found.originalPath)) {
-              await rm(found.originalPath, { recursive: true, force: true })
-            }
-            // The projection cache holds a per-session record outside the log
-            // directory; leaving it behind is the usual "still not clean" report.
-            await rm(projectionCacheFile(id), { force: true }).catch(() => {})
-
-            await writeIndex(entries.filter((candidate) => candidate.sessionId !== id))
-            return found
-          })
-
-          if (purged === undefined) return respond(res, 404, { ok: false, error: 'trash-entry-not-found' })
-
-          // Drop the workspace accounting slot too, so the id does not linger
-          // in `sessionIds` forever. `detachSession` is the public API for it.
-          try {
-            for (const workspace of registry()?.list() ?? []) {
-              if (workspace.sessionIds.includes(id)) await workspace.detachSession(id)
-            }
-          } catch (error) {
-            scoped.logger.warn('[dsh-toolbox] detach failed (harmless):', error)
-          }
-          try {
-            await registry()?.unarchiveSession(id)
-          } catch {
-            // Not archived is already the desired state.
-          }
-
-          respond(res, 200, { ok: true })
-        } catch (error) {
-          scoped.logger.warn('[dsh-toolbox] purge failed:', error)
-          respond(res, 500, { ok: false, error: 'purge-failed' })
-        }
+        const id = await readId(req, res)
+        if (id === undefined) return
+        await serialize(() => purgeSession(id, res))
       },
     })
   })

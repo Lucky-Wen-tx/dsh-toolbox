@@ -1,9 +1,12 @@
 {
   "name": "dsh-toolbox",
-  "version": "0.1.0",
-  "description": "DSH toolbox: session cleanup with a recoverable trash, plus room for more self-hosted tools.",
+  "version": "0.3.0",
+  "description": "DSH toolbox: session cleanup — archive a session in place, then destroy it for good.",
   "type": "module",
   "main": "src/host/index.js",
+  "scripts": {
+    "test": "node test/smoke.mjs && node test/client.mjs"
+  },
   "exports": {
     ".": "./src/host/index.js",
     "./client": "./src/client/index.js",

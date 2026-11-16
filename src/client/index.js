@@ -10,26 +10,57 @@ window.__ModuleLoader__.load({
 
 		const NS = 'dsh-toolbox';
 		const STATE_ROUTE = '/dsh-toolbox/state';
-		const DELETE_ROUTE = '/dsh-toolbox/delete';
-		const RESTORE_ROUTE = '/dsh-toolbox/restore';
+		const ARCHIVE_ROUTE = '/dsh-toolbox/archive';
+		const UNARCHIVE_ROUTE = '/dsh-toolbox/unarchive';
 		const PURGE_ROUTE = '/dsh-toolbox/purge';
 		/** How long the refresh spinner stays up at minimum, in milliseconds. */
 		const MIN_SPIN_MS = 1000;
+		/** How long a failure notice stays up, in milliseconds. */
+		const NOTICE_MS = 4000;
+
+		/**
+		 * The client root, captured in `apply` so the official session service
+		 * can be resolved at call time.
+		 *
+		 * Resolved lazily and through `ctx.get`, never injected: a plugin that
+		 * injected `sessions` would not mount at all on a build without it, and
+		 * this is only used to drop a destroyed row from the sidebar immediately
+		 * instead of waiting for the next list refresh.
+		 */
+		let clientContext = null;
+
+		function forgetInOfficialList(sessionId) {
+			let target = null;
+			try {
+				target = clientContext?.get?.('sessions') ?? null;
+			} catch {
+				target = null;
+			}
+			if (target === null) return;
+			try {
+				if (typeof target.handleSessionRemoved === 'function') target.handleSessionRemoved(sessionId);
+				if (typeof target.refresh === 'function') {
+					const refreshed = target.refresh();
+					if (refreshed !== null && typeof refreshed === 'object' && typeof refreshed.catch === 'function') {
+						refreshed.catch(() => {});
+					}
+				}
+			} catch {
+				// Purely cosmetic: the list refreshes on its own.
+			}
+		}
 
 		// ── copy ────────────────────────────────────────────────────────────
 		const STRINGS = {
 			zh: {
 				workspacesSection: '工作区',
-				trashSection: '回收站',
 				nav: '会话管理',
 				title: '会话管理',
-				subtitle: '按工作区分组列出会话；删除的会话先进入回收站，可以恢复，彻底删除不可撤销。',
+				subtitle: '按工作区分组列出会话；归档是隐藏会话的可逆步骤，彻底删除不可撤销。',
 				refresh: '刷新',
 				loading: '加载中…',
 				loadFailed: '读取会话数据失败',
 				empty: '没有会话。',
-				trashEmpty: '回收站是空的。',
-				trashGroup: (n, limit) => `回收站（${n}/${limit}）`,
 				orphanGroup: (n) => `孤儿子会话（${n}）`,
 				ungrouped: '未分组',
 				summary: (groups, n, size) => `${groups} 个工作区 · ${n} 个会话 · ${size}`,
@@ -41,29 +72,28 @@ window.__ModuleLoader__.load({
 				blank: '空白',
 				subagents: (n) => `${n} 个子代理`,
 				orphan: '父会话已删除',
-				del: '删除',
-				restore: '恢复',
+				archive: '归档',
+				unarchive: '取消归档',
 				purge: '彻底删除',
-				confirmDelete: (title) => `删除会话「${title}」？它会移入回收站，可以恢复。`,
-				confirmPurge: (title) => `彻底删除「${title}」？日志文件会被永久清除，无法恢复。`,
-				deleteFailed: '删除失败',
-				runningRefused: '会话正在运行，无法删除',
-				menuDelete: '删除会话',
-				menuRunning: '运行中，无法删除',
+				confirmPurge: (title, kids) => kids > 0
+					? `彻底删除「${title}」及其 ${kids} 个子代理？日志、缓存和登记记录都会被永久清除，无法恢复。`
+					: `彻底删除「${title}」？日志、缓存和登记记录都会被永久清除，无法恢复。`,
+				mustArchiveFirst: '先归档，才能彻底删除',
+				runningRefused: '会话正在运行，请稍后再试',
+				sessionInUse: '会话仍被当前进程持有，重启后再试',
+				artifactMissing: '找不到这会话的日志目录，未删除任何东西（插件与 DSH 版本可能不一致）',
+				actionFailed: '操作失败',
 				emptyGroup: '（该工作区暂无会话）',
 			},
 			en: {
 				workspacesSection: 'Workspaces',
-				trashSection: 'Trash',
 				nav: 'Sessions',
 				title: 'Session cleanup',
-				subtitle: 'Sessions grouped by workspace. Deleted sessions go to the trash first and can be restored; purging is permanent.',
+				subtitle: 'Sessions grouped by workspace. Archiving is the reversible way to hide one; destroying is permanent.',
 				refresh: 'Refresh',
 				loading: 'Loading…',
 				loadFailed: 'Failed to read session data',
 				empty: 'No sessions.',
-				trashEmpty: 'The trash is empty.',
-				trashGroup: (n, limit) => `Trash (${n}/${limit})`,
 				orphanGroup: (n) => `Orphaned subagents (${n})`,
 				ungrouped: 'Ungrouped',
 				summary: (groups, n, size) => `${groups} workspaces · ${n} sessions · ${size}`,
@@ -75,15 +105,17 @@ window.__ModuleLoader__.load({
 				blank: 'blank',
 				subagents: (n) => `${n} subagents`,
 				orphan: 'parent deleted',
-				del: 'Delete',
-				restore: 'Restore',
-				purge: 'Purge',
-				confirmDelete: (title) => `Delete "${title}"? It moves to the trash and can be restored.`,
-				confirmPurge: (title) => `Permanently delete "${title}"? Its log files cannot be recovered.`,
-				deleteFailed: 'Delete failed',
-				runningRefused: 'The session is running and cannot be deleted',
-				menuDelete: 'Delete session',
-				menuRunning: 'Running — cannot delete',
+				archive: 'Archive',
+				unarchive: 'Unarchive',
+				purge: 'Destroy',
+				confirmPurge: (title, kids) => kids > 0
+					? `Destroy "${title}" and its ${kids} subagent sessions? Their logs, cache and registry entries are removed permanently.`
+					: `Destroy "${title}"? Its logs, cache and registry entries are removed permanently.`,
+				mustArchiveFirst: 'Archive it first, then it can be destroyed',
+				runningRefused: 'The session is running — try again later',
+				sessionInUse: 'This process still holds the session open — try again after a restart',
+				artifactMissing: 'Could not find this session\'s log directory, so nothing was deleted (the plugin and DSH versions may differ)',
+				actionFailed: 'Action failed',
 				emptyGroup: '(no sessions in this workspace)',
 			},
 		};
@@ -256,13 +288,6 @@ window.__ModuleLoader__.load({
 			return `${value < 10 && unit > 0 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
 		}
 
-		function formatTime(ms) {
-			if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '';
-			const d = new Date(ms);
-			const pad = (n) => String(n).padStart(2, '0');
-			return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-		}
-
 		async function post(route, payload) {
 			const response = await fetch(route, {
 				method: 'POST',
@@ -353,19 +378,38 @@ window.__ModuleLoader__.load({
 			return groupHasRunning(group)
 		}
 
+		/** How many subagent sessions sit below this card, at any depth. */
+		function countSubtree(row) {
+			let total = 0;
+			for (const child of row.subagents || []) total += 1 + countSubtree(child);
+			return total;
+		}
+
 		// ── one row ─────────────────────────────────────────────────────────
+		/**
+		 * One session card.
+		 *
+		 * The archive toggle sits on the left and is the reversible step; the
+		 * destroy button sits on the right and stays disabled until the session
+		 * is archived. So the destructive click is always the second one, and
+		 * the card never hides which state it is in.
+		 *
+		 * A subagent child has no sidebar row and therefore no archive flag:
+		 * nested children are read-only (they leave together with their parent),
+		 * and an orphaned child (its parent is gone) can be destroyed directly —
+		 * otherwise nothing could ever clean it up.
+		 */
 		function SessionRow(props) {
-			const { row, s, busy, mode, onDelete, onRestore, onPurge, isChild } = props;
+			const { row, s, busy, isChild, onArchive, onUnarchive, onPurge } = props;
 			const title = row.title || s.unknownTitle;
 			const meta = [];
 			meta.push(row.cwd || s.noCwd);
 			const size = formatBytes(row.sizeBytes);
 			meta.push(size === null ? s.sizeUnknown : size);
-			if (mode === 'trash' && row.deletedAt) meta.push(formatTime(row.deletedAt));
 
 			const tags = [];
 			if (row.running) tags.push(h('span', { key: 'live', className: 'dsh-toolbox__tag dsh-toolbox__tag--live' }, s.live));
-			if (row.archived && mode !== 'trash') tags.push(h('span', { key: 'arch', className: 'dsh-toolbox__tag dsh-toolbox__tag--arch' }, s.archived));
+			if (row.archived) tags.push(h('span', { key: 'arch', className: 'dsh-toolbox__tag dsh-toolbox__tag--arch' }, s.archived));
 			if (row.blank) tags.push(h('span', { key: 'blank', className: 'dsh-toolbox__tag dsh-toolbox__tag--blank' }, s.blank));
 			if (row.isSubagent) tags.push(h('span', { key: 'sub', className: 'dsh-toolbox__tag dsh-toolbox__tag--sub' }, 'subagent'));
 			if (row.orphan) tags.push(h('span', { key: 'orphan', className: 'dsh-toolbox__tag dsh-toolbox__tag--orphan' }, s.orphan));
@@ -373,45 +417,42 @@ window.__ModuleLoader__.load({
 				tags.push(h('span', { key: 'kids', className: 'dsh-toolbox__tag dsh-toolbox__tag--sub' }, s.subagents(row.subagents.length)));
 			}
 
-			const actions = mode === 'trash'
-				? [
-					h('button', {
-						key: 'restore',
-						type: 'button',
-						className: 'dsh-toolbox__btn',
-						disabled: busy,
-						onClick: onRestore,
-					}, s.restore),
-					h('button', {
-						key: 'purge',
-						type: 'button',
-						className: 'dsh-toolbox__btn dsh-toolbox__btn--danger',
-						disabled: busy || row.running,
-						title: row.running ? s.runningRefused : undefined,
-						onClick: onPurge,
-					}, s.purge),
-				]
-				: [
-					h('button', {
-						key: 'delete',
-						type: 'button',
-						className: 'dsh-toolbox__btn dsh-toolbox__btn--danger',
-						disabled: busy || row.running,
-						title: row.running ? s.runningRefused : undefined,
-						onClick: onDelete,
-					}, s.del),
-				];
+			const actions = [];
+			if (!isChild) {
+				actions.push(h('button', {
+					key: 'archive',
+					type: 'button',
+					className: 'dsh-toolbox__btn',
+					disabled: busy || row.running,
+					title: row.running ? s.runningRefused : undefined,
+					onClick: row.archived ? onUnarchive : onArchive,
+				}, row.archived ? s.unarchive : s.archive));
+			}
+			if (!isChild || row.orphan) {
+				const destroyable = row.orphan === true || row.archived === true;
+				const blocked = row.running ? s.runningRefused
+					: (row.agentAvailable ? s.sessionInUse
+						: (destroyable ? undefined : s.mustArchiveFirst));
+				actions.push(h('button', {
+					key: 'purge',
+					type: 'button',
+					className: 'dsh-toolbox__btn dsh-toolbox__btn--danger',
+					disabled: busy || !destroyable || row.running || row.agentAvailable,
+					title: blocked,
+					onClick: onPurge,
+				}, s.purge));
+			}
 
 			return h('li', {
 				className: 'dsh-toolbox__row',
-				'data-dim': row.archived || mode === 'trash' ? '' : undefined,
+				'data-dim': row.archived ? '' : undefined,
 				'data-child': isChild ? '' : undefined,
 			},
 				h('div', { className: 'dsh-toolbox__main' },
 					h('div', { className: 'dsh-toolbox__name', title }, title, ...tags),
 					h('div', { className: 'dsh-toolbox__meta' }, meta.join(' · ')),
 				),
-				h('div', { className: 'dsh-toolbox__actions' }, ...actions),
+				actions.length === 0 ? null : h('div', { className: 'dsh-toolbox__actions' }, ...actions),
 			);
 		}
 
@@ -420,7 +461,9 @@ window.__ModuleLoader__.load({
 			const s = useLocaleStrings();
 			const [state, setState] = React.useState(null);
 			const [error, setError] = React.useState(null);
-			const [busyId, setBusyId] = React.useState(null);
+			const [busyIds, setBusyIds] = React.useState(() => new Set());
+			const [notice, setNotice] = React.useState(null);
+			const noticeTimer = React.useRef(null);
 			// Explicit open/closed choices, loaded once from storage so a reload
 			// and a restart both restore what the user last did.
 			const [view, setView] = React.useState(loadViewState);
@@ -509,23 +552,55 @@ window.__ModuleLoader__.load({
 				}
 			}, [manualLoading, reload]);
 
+			/**
+			 * Show one failure at a time, above the list.
+			 *
+			 * A blocking `alert` would freeze the poll and the spinner, and two
+			 * quick failures would stack modal dialogs; a notice that replaces
+			 * itself and expires keeps the page responsive. The timer is the
+			 * newest one only, so a second message restarts the countdown.
+			 */
+			const showNotice = React.useCallback((text) => {
+				if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
+				setNotice(text);
+				noticeTimer.current = window.setTimeout(() => {
+					noticeTimer.current = null;
+					setNotice(null);
+				}, NOTICE_MS);
+			}, []);
+
+			React.useEffect(() => () => {
+				if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
+			}, []);
+
+			const markBusy = (sessionId, busy) => {
+				setBusyIds((previous) => {
+					const next = new Set(previous);
+					if (busy) next.add(sessionId);
+					else next.delete(sessionId);
+					return next;
+				});
+			};
+
 			const withBusy = async (sessionId, run) => {
-				setBusyId(sessionId);
+				markBusy(sessionId, true);
+				setNotice(null);
 				try {
 					await run();
 					await reload();
 				} catch (failure) {
 					const code = failure instanceof Error ? failure.message : '';
-					window.alert(code === 'session-running' ? s.runningRefused : code);
+					if (code === 'session-running') showNotice(s.runningRefused);
+					else if (code === 'session-in-use') showNotice(s.sessionInUse);
+					else if (code === 'artifact-not-located') showNotice(s.artifactMissing);
+					else showNotice(`${s.actionFailed}: ${code}`);
 				} finally {
-					setBusyId(null);
+					markBusy(sessionId, false);
 				}
 			};
 
 			const groups = state === null ? [] : state.groups;
 			const orphans = state === null ? [] : state.orphans;
-			const entries = state === null ? [] : state.entries;
-			const limit = state === null ? 20 : state.limit;
 			const totalBytes = state === null ? 0 : state.totalBytes;
 			const sessionCount = groups.reduce((sum, group) => sum + group.sessions.length, 0);
 
@@ -536,36 +611,44 @@ window.__ModuleLoader__.load({
 				}));
 			};
 
-			const askDelete = (row) => {
-				if (!window.confirm(s.confirmDelete(row.title || s.unknownTitle))) return;
-				void withBusy(row.id, () => post(DELETE_ROUTE, { sessionId: row.id, title: row.title }));
+			// The archive toggle is the reversible step; the destroy button only
+			// fires once the card is archived, and always through a confirmation
+			// that names how much of the subagent subtree goes with it.
+			const archiveToggle = (row) => {
+				const route = row.archived ? UNARCHIVE_ROUTE : ARCHIVE_ROUTE;
+				void withBusy(row.id, () => post(route, { sessionId: row.id }));
 			};
 
-			const renderRow = (row, mode, isChild) => h(SessionRow, {
+			const askPurge = (row) => {
+				if (!window.confirm(s.confirmPurge(row.title || s.unknownTitle, countSubtree(row)))) return;
+				void withBusy(row.id, async () => {
+					await post(PURGE_ROUTE, { sessionId: row.id });
+					// The files and registry entries are gone, so the official
+					// list should stop naming it now rather than at the next
+					// refresh — the sidebar is visible behind this page.
+					forgetInOfficialList(row.id);
+				});
+			};
+
+			const renderRow = (row, isChild) => h(SessionRow, {
 				key: row.id,
 				row,
 				s,
-				mode,
 				isChild,
-				busy: busyId === row.id,
-				onDelete: () => askDelete(row),
-				onRestore: () => {
-					void withBusy(row.id, () => post(RESTORE_ROUTE, { sessionId: row.id }));
-				},
-				onPurge: () => {
-					if (!window.confirm(s.confirmPurge(row.title || s.unknownTitle))) return;
-					void withBusy(row.id, () => post(PURGE_ROUTE, { sessionId: row.id }));
-				},
+				busy: busyIds.has(row.id),
+				onArchive: () => archiveToggle(row),
+				onUnarchive: () => archiveToggle(row),
+				onPurge: () => askPurge(row),
 			});
 
-			const renderGroup = (group, index) => {
+			const renderGroup = (group) => {
 				const key = group.workspaceId || '__ungrouped__';
 				const isOpen = resolveGroupOpen(groupOpen, key, group);
 				const label = group.title === null ? s.ungrouped : group.title;
 				const rows = [];
 				for (const row of group.sessions) {
-					rows.push(renderRow(row, 'active', false));
-					for (const child of row.subagents || []) rows.push(renderRow(child, 'active', true));
+					rows.push(renderRow(row, false));
+					for (const child of row.subagents || []) rows.push(renderRow(child, true));
 				}
 				return h('div', { className: 'dsh-toolbox__group', key },
 					h('button', {
@@ -589,22 +672,13 @@ window.__ModuleLoader__.load({
 				);
 			};
 
-			const trashRows = entries.map((entry) => ({
-				id: entry.sessionId,
-				title: entry.title,
-				cwd: entry.cwd,
-				archived: true,
-				running: false,
-				isSubagent: entry.isSubagent === true,
-				deletedAt: entry.deletedAt,
-			}));
-
 			return h('div', { className: 'dsh-toolbox', 'data-dsh-toolbox': '' },
 				h('header', { className: 'dsh-toolbox__head' },
 					h('h2', { className: 'dsh-toolbox__title' }, s.title),
 					h('p', { className: 'dsh-toolbox__sub' }, s.subtitle),
 				),
 				error === null ? null : h('div', { className: 'dsh-toolbox__error' }, `${s.loadFailed}: ${error}`),
+				notice === null ? null : h('div', { className: 'dsh-toolbox__error', role: 'alert' }, notice),
 
 				// ── section 1: workspaces ──────────────────────────────────
 				h('div', { className: 'dsh-toolbox__section' },
@@ -637,94 +711,23 @@ window.__ModuleLoader__.load({
 						: h('div', { className: 'dsh-toolbox__groups' }, ...groups.map(renderGroup)),
 				),
 
-				// ── section 2: trash ───────────────────────────────────────
-				h('div', { className: 'dsh-toolbox__section' },
+				// ── section 2: orphaned subagents (their parent is gone) ───
+				orphans.length === 0 ? null : h('div', { className: 'dsh-toolbox__section' },
 					h('div', { className: 'dsh-toolbox__sectionHead' },
-						h('span', { className: 'dsh-toolbox__sectionTitle' }, s.trashSection),
-						h('span', { className: 'dsh-toolbox__sectionCount' }, `${trashRows.length} / ${limit}`),
-						orphans.length === 0 ? null : h('button', {
+						h('span', { className: 'dsh-toolbox__sectionTitle' }, s.orphanGroup(orphans.length)),
+						h('button', {
 							type: 'button',
 							className: 'dsh-toolbox__btn dsh-toolbox__sectionAction',
 							'aria-expanded': orphanOpen ? 'true' : 'false',
 							onClick: () => setView((prev) => ({ ...prev, orphans: !prev.orphans })),
-						}, s.orphanGroup(orphans.length)),
+						}, orphanOpen ? '−' : '+'),
 					),
-					orphans.length === 0 ? null : (orphanOpen
+					orphanOpen
 						? h('ul', { className: 'dsh-toolbox__list' },
-							...orphans.map((row) => renderRow({ ...row, orphan: true }, 'active', true)))
-						: null),
-					trashRows.length === 0
-						? h('div', { className: 'dsh-toolbox__empty' }, s.trashEmpty)
-						: h('ul', { className: 'dsh-toolbox__list' },
-							...trashRows.map((row) => renderRow(row, 'trash', false))),
+							...orphans.map((row) => renderRow({ ...row, orphan: true }, true)))
+						: null,
 				),
 			);
-		}
-
-		// ── the session-row menu item ───────────────────────────────────────
-		function DeleteMenuItem(props) {
-			const s = useLocaleStrings();
-			const sessionId = props.sessionId;
-			const displayTitle = props.displayTitle;
-			const useMenuOpenState = props.useMenuOpenState;
-			const setMenuOpen = useMenuOpenState()[1];
-			const [busy, setBusy] = React.useState(false);
-			const [running, setRunning] = React.useState(false);
-
-			React.useEffect(() => {
-				let cancelled = false;
-				void (async () => {
-					try {
-						const state = await fetchState();
-						if (cancelled) return;
-						for (const group of state.groups) {
-							for (const row of group.sessions) {
-								if (row.id === sessionId) {
-									setRunning(row.running === true);
-									return;
-								}
-								for (const child of row.subagents || []) {
-									if (child.id === sessionId) {
-										setRunning(child.running === true);
-										return;
-									}
-								}
-							}
-						}
-					} catch {
-						// Leave it enabled; the host refuses a running session anyway.
-					}
-				})();
-				return () => {
-					cancelled = true;
-				};
-			}, [sessionId]);
-
-			const onClick = () => {
-				if (busy) return;
-				setMenuOpen(false);
-				if (!window.confirm(s.confirmDelete(displayTitle || s.unknownTitle))) return;
-				setBusy(true);
-				void (async () => {
-					try {
-						await post(DELETE_ROUTE, { sessionId, title: displayTitle });
-					} catch (failure) {
-						const code = failure instanceof Error ? failure.message : '';
-						window.alert(code === 'session-running' ? s.runningRefused : `${s.deleteFailed}: ${code}`);
-					} finally {
-						setBusy(false);
-					}
-				})();
-			};
-
-			return h('button', {
-				type: 'button',
-				role: 'menuitem',
-				disabled: busy || running,
-				title: running ? s.menuRunning : undefined,
-				onClick,
-				style: { color: running ? undefined : '#dc2626' },
-			}, s.menuDelete);
 		}
 
 		// ── plugin entry ────────────────────────────────────────────────────
@@ -732,6 +735,7 @@ window.__ModuleLoader__.load({
 		exports.inject = ['slots', 'locale'];
 
 		function apply(ctx) {
+			clientContext = ctx;
 			ensureStyle();
 			// The style lives as long as the plugin fiber, not as long as any one
 			// slot registration: an early removal would strip the menu item too.
@@ -749,13 +753,6 @@ window.__ModuleLoader__.load({
 				order: 60,
 				label: () => strings().nav,
 			}, SessionPanel));
-
-			ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({
-				name: 'sidebar.workspaces.session.menu.item',
-				id: 'dsh-toolbox-delete-session',
-				order: 400,
-				label: () => strings().menuDelete,
-			}, DeleteMenuItem));
 		}
 
 		exports.apply = apply;

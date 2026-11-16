@@ -4,6 +4,6 @@
 # an export in package.json — the other rows keep their own lifecycle, so
 # `disabled: true` on one never touches the rest.
 - insert:
-    # Session cleanup: list, soft-delete into a trash, restore, purge.
+    # Session cleanup: list, archive in place, destroy permanently.
     - id: dsh-toolbox-sessions
       name: dsh-toolbox
