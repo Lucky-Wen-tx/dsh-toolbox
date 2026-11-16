@@ -1,7 +1,7 @@
 {
   "name": "dsh-toolbox",
-  "version": "0.3.1",
-  "description": "DSH toolbox: session cleanup — archive a session in place, then destroy it for good.",
+  "version": "0.4.0",
+  "description": "Session cleanup for the DeepSeek Harness Web UI: archive a session in place, then destroy it for good.",
   "type": "module",
   "main": "src/host/index.js",
   "scripts": {
@@ -18,6 +18,23 @@
     "README.md",
     "LICENSE"
   ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "session",
+    "cleanup",
+    "archive",
+    "delete"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lucky-Wen-tx/dsh-toolbox.git"
+  },
+  "homepage": "https://github.com/Lucky-Wen-tx/dsh-toolbox#readme",
+  "bugs": {
+    "url": "https://github.com/Lucky-Wen-tx/dsh-toolbox/issues"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

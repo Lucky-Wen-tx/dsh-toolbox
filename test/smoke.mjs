@@ -55,7 +55,7 @@ for (const id of ['session-a', 'child-1', 'session-b', 'session-d', 'session-e',
 }
 
 const calls = []
-const archived = new Set(['session-a', 'session-c', 'session-d', 'session-e', 'session-f', 'session-g', 'session-h', 'session-i'])
+const archived = new Set(['session-a', 'session-c', 'session-d', 'session-e', 'session-f', 'session-g', 'session-h', 'session-i', 'session-gone'])
 const detached = new Set()
 
 const snapshots = new Map([
@@ -261,6 +261,10 @@ await sleep(50)
 assert.equal(cacheTable.ids.has('ghost'), false, 'orphaned projection record is dropped')
 assert.equal(cacheTable.ids.has('session-a'), true, 'a live session keeps its record')
 assert.equal(existsSync(dirA), true, 'the sweep never deletes a session log')
+
+// The archive sweep drops a flag whose session no session list answers for.
+assert.equal(archived.has('session-gone'), false, 'a stale archive flag is dropped')
+assert.equal(archived.has('session-a'), true, 'a live session keeps its flag')
 
 // ── GET /state ─────────────────────────────────────────────────────────────
 {

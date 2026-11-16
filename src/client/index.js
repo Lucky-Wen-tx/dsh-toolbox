@@ -8,7 +8,6 @@ window.__ModuleLoader__.load({
 		const React = require('react');
 		const h = React.createElement;
 
-		const NS = 'dsh-toolbox';
 		const STATE_ROUTE = '/dsh-toolbox/state';
 		const ARCHIVE_ROUTE = '/dsh-toolbox/archive';
 		const UNARCHIVE_ROUTE = '/dsh-toolbox/unarchive';
@@ -832,7 +831,6 @@ window.__ModuleLoader__.load({
 		// ── plugin entry ────────────────────────────────────────────────────
 		exports.name = 'dsh-toolbox/client';
 		exports.inject = ['slots', 'locale'];
-
 		function apply(ctx) {
 			clientContext = ctx;
 			ensureStyle();
@@ -855,7 +853,6 @@ window.__ModuleLoader__.load({
 		}
 
 		exports.apply = apply;
-		exports.NS = NS;
 		return module.exports;
 	}
 });

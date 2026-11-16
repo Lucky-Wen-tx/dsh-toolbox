@@ -1,15 +1,13 @@
 # dsh-toolbox
 
-A small toolbox for the DeepSeek-Harness Web UI. One package, one row per
-feature, so a broken or disabled feature never takes the others down.
+Session cleanup for the DeepSeek-Harness Web UI: list sessions with their real
+on-disk footprint, archive one in place, and destroy it for good.
 
-Currently shipped:
+The package does one thing. It used to be a toolbox with one row per feature;
+that scaffolding is gone, so the name is now historical and no second feature is
+planned.
 
-| Row | Feature |
-|---|---|
-| `dsh-toolbox-sessions` | Session cleanup: list sessions with their real on-disk size, archive one in place, and destroy it for good. |
-
-## What the session row does
+## What it does
 
 - **Settings → 会话管理 / Sessions** — a page listing sessions grouped by
   workspace: title, working directory, log size, `running` / `blank` / `archived`
@@ -21,9 +19,10 @@ Currently shipped:
     uses, so the session disappears from the sidebar's default view without its
     log moving anywhere. The button becomes **取消归档 / Unarchive** once the
     card is archived.
-  - **Destroy** stays disabled until the card is archived. Clicking it asks for
-    confirmation, then removes the session's log directory, its projection cache
-    and every registry entry that names it — together with its whole subagent
+  - **Destroy** stays disabled until the card is archived. Clicking it asks the
+    Host what would be removed, confirms the subtree, bytes and registry entries
+    with you, then removes the session's log directory, its projection cache and
+    every registry entry that names it — together with its whole subagent
     subtree, which could never be opened once the parent is gone.
 - An **orphaned subagent** (its parent is gone) can be destroyed directly: it has
   no sidebar row and therefore no archive flag, so nothing else could ever clean
@@ -81,10 +80,11 @@ Currently shipped:
   projection records no session answers for, project directories a destroy left
   empty, and archive flags whose session no longer exists. All three are derived
   or dangling state; an empty or failed session listing leaves everything alone.
-- **No trash any more.** Earlier versions deleted a session by moving its log into
-  `<DSH_HOME>/dsh-toolbox/trash/`; that model is gone. Logs still parked there are
-  put back into the sessions root on first start — they keep their archive flag,
-  so they appear as archived cards and the user decides whether to destroy them.
+- **No trash.** Earlier versions moved a deleted log into
+  `<DSH_HOME>/dsh-toolbox/trash/` and put it back on the next start; that
+  migration is gone with its last release. A log still parked there is not
+  touched any more — move the directory back under the sessions root yourself,
+  then archive or destroy it from the panel as usual.
 - Only public services are used: `sessionController.list()` for the rows,
   `sessionPersistence.list()` for sizes and paths, and
   `workspaceRegistry.archiveSession` / `unarchiveSession` / `unpinSession` plus
@@ -112,18 +112,21 @@ Or install the directory through the plugin manager, then restart `dsh web`.
 ## Layout
 
 ```
-src/host/index.js     the host row: session view, archive toggle, destroy route
-src/client/index.js   the client bundle: the settings page with its cards
-cordis.patch.yml      one `insert` row per feature
-test/smoke.mjs        route-level assertions on a fake context and temp DSH_HOME
-test/client.mjs       loads the client bundle and renders the page with stub React
+src/host/index.js      service wiring, the mutation queue, the routes
+src/host/paths.js      on-disk layout, id encoding, directory validation
+src/host/http.js       body reading, the id gate, the same-origin gate
+src/host/view.js       both listings, the subagent tree, the panel's rows
+src/host/mutations.js  archive, unarchive, preview, destroy
+src/host/startup.js    the two post-start sweeps of leftover state
+src/client/index.js    the client bundle: the settings page with its cards
+cordis.patch.yml       the one `insert` row that mounts the host plugin
+test/smoke.mjs         route-level assertions on a fake context and temp DSH_HOME
+test/client.mjs        loads the client bundle and renders the page with stub React
 ```
 
 `npm test` runs both; neither needs a dependency, a build step, or a Host.
-
-Adding a feature means: a new `src/host/<feature>.js` exporting
-`name`/`inject`/`apply`, an `exports` entry in `package.json`, and one more row
-in `cordis.patch.yml`.
+The client stays one file on purpose: the Web loader executes the bundle as a
+single module, so a local `import` there is not an option.
 
 ## Routes
 
