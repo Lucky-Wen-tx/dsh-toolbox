@@ -1,6 +1,6 @@
 {
   "name": "dsh-toolbox",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "DSH toolbox: session cleanup — archive a session in place, then destroy it for good.",
   "type": "module",
   "main": "src/host/index.js",

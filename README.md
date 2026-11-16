@@ -37,6 +37,10 @@ Currently shipped:
   a turn runs, `409 session-in-use` while an agent is loaded or the in-memory
   session store still holds the session. Its agent may still be writing the log,
   and the Host keeps listing a live session from memory after the files are gone.
+- **Work the archive gate would name is refused too.** Destroy asks the same
+  `workspace/session-activity` waterfall the registry asks on archive, so a job or
+  a schedule that still names the session blocks it with `409 session-active`
+  instead of being left pointing at nothing.
 - **Destroy leaves nothing behind:** the log directory with everything inside it,
   the session's record in the `session_projcache` storage domain (removed through
   the domain's own table, so a non-file backend is covered too, with the
@@ -50,14 +54,29 @@ Currently shipped:
   attributed to a single session.
 - **Nothing is deleted before it is found.** Destroy resolves every artifact
   directory first — the backend's own `sessionPersistence.locate()`, then the
-  snapshot's `location`, then the documented layout — and refuses the whole
-  subtree with `409 artifact-not-located` when a session the backend knows has no
-  directory this build can reach. Clearing the registry while the log survives
-  would hide the session from every list while leaving its bytes on disk.
+  snapshot's `location`, then the documented layout. Backend-supplied paths are
+  validated by content: the directory's name must be this id's injective encoding
+  and it must hold a session log generation, which is what makes a profile with
+  its own persistence root work without trusting an arbitrary path. Derived and
+  scanned paths must still sit inside `<DSH_HOME>/sessions`. A session the
+  backend knows but this build cannot resolve is refused with
+  `409 artifact-not-located` instead of having its registry entry cleared while
+  the log survives.
+- **Deletion is retried, ordered, and reported.** Children are removed before
+  their parent, a busy file is retried three times, and a directory that still
+  cannot be removed is reported as `500 purge-partial` with the surviving ids;
+  those keep their archive flag and workspace slot so the action can be retried.
 - **One mutation at a time.** Archive, unarchive and destroy run through a
   per-plugin queue: two cards clicked in quick succession complete in order, so a
   destroy can never interleave its steps with another one and leave half the
   registry cleaned.
+- **Mutating routes are same-origin only.** A browser request must arrive with
+  `Sec-Fetch-Site: same-origin` (or an `Origin` that matches `Host`); anything
+  else is `403 forbidden-origin`. A cross-origin page can send a `text/plain`
+  "simple" POST to loopback without a preflight, and the body is JSON either way.
+- **The confirmation is computed, not guessed.** The panel asks
+  `POST /dsh-toolbox/preview` first and names the subtree, the bytes, the cache
+  records, the workspaces and the pins that the destroy would remove.
 - **Leftovers are swept once.** On first read after start the row drops
   projection records no session answers for, project directories a destroy left
   empty, and archive flags whose session no longer exists. All three are derived
@@ -111,14 +130,20 @@ in `cordis.patch.yml`.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/dsh-toolbox/state` | grouped sessions and orphans in one read |
+| POST | `/dsh-toolbox/preview` | what destroying one session would remove, read-only |
 | POST | `/dsh-toolbox/archive` | archive one session (reversible) |
 | POST | `/dsh-toolbox/unarchive` | undo that archive |
 | POST | `/dsh-toolbox/purge` | permanent removal of one archived session |
 
-`archive` answers `409 session-running` for a session executing a turn. `purge`
+`archive` answers `409 session-running` for a session executing a turn,
+`409 session-active` when a job or schedule still names it, and
+`404 session-not-found` when neither memory nor persistence knows it. `purge`
 answers `409 session-not-archived`, `409 session-running`, `409 session-in-use`
-when the Host still holds the session, and `409 artifact-not-located` when the
-backend knows a log this build cannot resolve — in every case nothing is removed.
+when the Host still holds the session, `409 session-active`, `409
+artifact-not-located` when the backend knows a log this build cannot resolve, and
+`500 purge-partial` with the surviving ids. Every mutating route answers
+`403 forbidden-origin` for a cross-origin browser request. In every refusal case
+nothing is removed.
 
 ## License
 

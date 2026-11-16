@@ -42,13 +42,20 @@ await makeSession(proj, 'session-b')
 await makeSession(proj, 'session-d')
 const dirE = await makeSession(proj, 'session-e')
 await makeSession(join(sessionsRoot, '--other--'), 'session-f')
+// A session in a persistence root the plugin never derived.
+const customRoot = join(home, 'custom-sessions')
+const dirG = await makeSession(join(customRoot, '--x--'), 'session-g')
+// A session a job still names.
+const dirH = await makeSession(proj, 'session-h')
+// A session left alone while the persistence service is unavailable.
+const dirI = await makeSession(proj, 'session-i')
 // `session-c` is a snapshot the backend knows about but whose log is gone.
 for (const id of ['session-a', 'child-1', 'session-b', 'session-d', 'session-e', 'session-f', 'ghost']) {
   await makeCacheRecord(id)
 }
 
 const calls = []
-const archived = new Set(['session-a', 'session-c', 'session-d', 'session-e', 'session-f'])
+const archived = new Set(['session-a', 'session-c', 'session-d', 'session-e', 'session-f', 'session-g', 'session-h', 'session-i'])
 const detached = new Set()
 
 const snapshots = new Map([
@@ -61,11 +68,20 @@ const snapshots = new Map([
   ['session-e', { id: 'session-e', cwd: 'D:\\proj', createdAt: 6 }],
   // Only `locate()` can find this one: the header carries no cwd.
   ['session-f', { id: 'session-f', createdAt: 7 }],
+  ['session-g', { id: 'session-g', createdAt: 8 }],
+  ['session-h', { id: 'session-h', cwd: 'D:\\proj', createdAt: 9 }],
+  ['session-i', { id: 'session-i', cwd: 'D:\\proj', createdAt: 10 }],
 ])
 
 const located = new Map([
   ['session-f', logPath(join(sessionsRoot, '--other--', 'session-f'))],
+  ['session-g', logPath(dirG)],
 ])
+
+const activity = new Map([
+  ['session-h', [{ kind: 'job', id: 'job-1', label: 'nightly build' }]],
+])
+let persistenceAvailable = true
 
 const summaries = [
   { sessionId: 'session-a', cwd: 'D:\\proj', updatedAt: 10, running: false, agentAvailable: false, origin: 'web', projections: { values: { title: 'A' } } },
@@ -75,6 +91,9 @@ const summaries = [
   { sessionId: 'session-d', cwd: 'D:\\proj', updatedAt: 6, running: false, agentAvailable: false, origin: 'web' },
   { sessionId: 'session-e', cwd: 'D:\\proj', updatedAt: 5, running: false, agentAvailable: false, origin: 'web' },
   { sessionId: 'session-f', updatedAt: 4, running: false, agentAvailable: false, origin: 'web' },
+  { sessionId: 'session-g', updatedAt: 3, running: false, agentAvailable: false, origin: 'web' },
+  { sessionId: 'session-h', cwd: 'D:\\proj', updatedAt: 2, running: false, agentAvailable: false, origin: 'web' },
+  { sessionId: 'session-i', cwd: 'D:\\proj', updatedAt: 1, running: false, agentAvailable: false, origin: 'web' },
   { sessionId: 'session-running', cwd: 'D:\\proj', updatedAt: 3, running: true, agentAvailable: true, origin: 'web' },
 ]
 
@@ -87,6 +106,9 @@ class FakeCacheTable {
   }
   *keys() {
     for (const id of [...this.ids].sort()) yield id
+  }
+  get(id) {
+    return this.ids.has(id) ? { ver: 7 } : undefined
   }
   async delete(id) {
     calls.push(['cache-delete', id])
@@ -110,7 +132,7 @@ const workspace = {
   title: 'proj',
   path: 'D:\\proj',
   get sessionIds() {
-    return ['session-a', 'session-b', 'session-c', 'session-d', 'session-e', 'session-f']
+    return ['session-a', 'session-b', 'session-c', 'session-d', 'session-e', 'session-f', 'session-g', 'session-h', 'session-i']
       .filter((id) => !detached.has(id))
   },
   async detachSession(id) {
@@ -121,6 +143,15 @@ const workspace = {
 
 const scoped = {
   logger: { info() {}, warn() {}, debug() {} },
+  /**
+   * The same event the registry's archive gate asks. `session-h` has a job that
+   * still names it, which is what an archive would refuse and a destroy must
+   * refuse too.
+   */
+  async waterfall(name, payload, next) {
+    if (name === 'workspace/session-activity') return activity.get(payload.sessionId) ?? []
+    return typeof next === 'function' ? next() : []
+  },
   get(name) {
     if (name === 'sessionController') {
       return {
@@ -128,6 +159,7 @@ const scoped = {
       }
     }
     if (name === 'sessionPersistence') {
+      if (!persistenceAvailable) return undefined
       return {
         list: async () => [...snapshots.values()].map((header) => ({
           header,
@@ -142,6 +174,7 @@ const scoped = {
     if (name === 'workspaceRegistry') {
       return {
         list: () => [workspace],
+        pinnedSessionIds: [],
         async archiveSession(id) {
           calls.push(['archive', id])
           archived.add(id)
@@ -187,9 +220,10 @@ scoped.webServer = {
   },
 }
 
-function post(payload) {
+function post(payload, headers = { 'sec-fetch-site': 'same-origin' }) {
   const req = Readable.from([Buffer.from(JSON.stringify(payload))])
   req.method = 'POST'
+  req.headers = headers
   return req
 }
 
@@ -206,11 +240,11 @@ function makeRes() {
   }
 }
 
-async function call(path, payload) {
+async function call(path, payload, headers) {
   const handler = routes.get(path)
   assert.ok(handler !== undefined, `route ${path} is registered`)
   const res = makeRes()
-  await handler(post(payload), res)
+  await handler(post(payload, headers), res)
   return res
 }
 
@@ -245,6 +279,22 @@ assert.equal(existsSync(dirA), true, 'the sweep never deletes a session log')
   assert.deepEqual(res.body.orphans, [], 'no orphan while the parent exists')
 }
 
+// ── preview: what the destroy would remove, without removing it ────────────
+{
+  const res = await call('/dsh-toolbox/preview', { sessionId: 'session-a' })
+  assert.equal(res.status, 200)
+  assert.equal(res.body.ok, true)
+  assert.equal(res.body.archived, true)
+  assert.equal(res.body.busy, null)
+  assert.equal(res.body.sessions.length, 2, 'the preview names the subtree')
+  assert.equal(res.body.directories, 2, 'both logs are on disk')
+  assert.equal(res.body.bytes, 1024, 'sizes are summed')
+  assert.deepEqual(res.body.workspaces, ['ws-1'])
+  assert.equal(res.body.projectionRecords, 2)
+  assert.deepEqual(res.body.activity, [])
+  assert.equal(existsSync(dirA), true, 'a preview deletes nothing')
+}
+
 // ── purge: archived parent takes its subtree ───────────────────────────────
 {
   const res = await call('/dsh-toolbox/purge', { sessionId: 'session-a' })
@@ -258,6 +308,24 @@ assert.equal(existsSync(dirA), true, 'the sweep never deletes a session log')
   for (const [step, id] of [['unpin', 'session-a'], ['unarchive', 'session-a'], ['detach', 'session-a'], ['unpin', 'child-1'], ['unarchive', 'child-1']]) {
     assert.ok(calls.some((call) => call[0] === step && call[1] === id), `${step} ran for ${id}`)
   }
+}
+
+// ── purge: work the archive gate would name is refused ────────────────────
+{
+  const res = await call('/dsh-toolbox/purge', { sessionId: 'session-h' })
+  assert.equal(res.status, 409)
+  assert.equal(res.body.error, 'session-active')
+  assert.equal(res.body.activity.length, 1)
+  assert.equal(res.body.activity[0].sessionId, 'session-h')
+  assert.equal(res.body.activity[0].activity[0].label, 'nightly build')
+  assert.equal(existsSync(dirH), true, 'nothing was deleted')
+}
+
+// ── purge: a custom persistence root is trusted when the path proves itself ─
+{
+  const res = await call('/dsh-toolbox/purge', { sessionId: 'session-g' })
+  assert.equal(res.status, 200)
+  assert.equal(existsSync(dirG), false, 'the log outside <DSH_HOME>/sessions is gone')
 }
 
 // ── purge: refuse when the backend knows a log this build cannot find ──────
@@ -323,6 +391,29 @@ assert.equal(existsSync(dirA), true, 'the sweep never deletes a session log')
     lastOfFirst < firstOfSecond || lastOfSecond < firstBlock,
     'the two mutations do not interleave',
   )
+}
+
+// ── purge: no persistence service means "cannot look", never "no log" ─────
+{
+  persistenceAvailable = false
+  const res = await call('/dsh-toolbox/purge', { sessionId: 'session-i' })
+  persistenceAvailable = true
+  assert.equal(res.status, 503)
+  assert.equal(res.body.error, 'persistence-unavailable')
+  assert.equal(existsSync(dirI), true, 'nothing was deleted and the flag was kept')
+  assert.equal(archived.has('session-i'), true)
+
+  const retried = await call('/dsh-toolbox/purge', { sessionId: 'session-i' })
+  assert.equal(retried.status, 200)
+  assert.equal(existsSync(dirI), false)
+}
+
+// ── a cross-origin browser request is refused before anything happens ──────
+{
+  const res = await call('/dsh-toolbox/purge', { sessionId: 'session-h' }, { 'sec-fetch-site': 'cross-site' })
+  assert.equal(res.status, 403)
+  assert.equal(res.body.error, 'forbidden-origin')
+  assert.equal(existsSync(dirH), true)
 }
 
 // ── malformed input ───────────────────────────────────────────────────────

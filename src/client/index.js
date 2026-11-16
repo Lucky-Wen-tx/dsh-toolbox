@@ -12,6 +12,7 @@ window.__ModuleLoader__.load({
 		const STATE_ROUTE = '/dsh-toolbox/state';
 		const ARCHIVE_ROUTE = '/dsh-toolbox/archive';
 		const UNARCHIVE_ROUTE = '/dsh-toolbox/unarchive';
+		const PREVIEW_ROUTE = '/dsh-toolbox/preview';
 		const PURGE_ROUTE = '/dsh-toolbox/purge';
 		/** How long the refresh spinner stays up at minimum, in milliseconds. */
 		const MIN_SPIN_MS = 1000;
@@ -78,6 +79,20 @@ window.__ModuleLoader__.load({
 				confirmPurge: (title, kids) => kids > 0
 					? `彻底删除「${title}」及其 ${kids} 个子代理？日志、缓存和登记记录都会被永久清除，无法恢复。`
 					: `彻底删除「${title}」？日志、缓存和登记记录都会被永久清除，无法恢复。`,
+				confirmPurgeDetailed: (title, kids, dirs, size, cache, workspaces, pinned) => {
+					const lines = [`彻底删除「${title}」？此操作不可撤销。`];
+					if (kids > 0) lines.push(`同时删除其 ${kids} 个子代理会话。`);
+					lines.push(`将删除 ${dirs} 个日志目录（共 ${size}）和 ${cache} 条投影缓存记录。`);
+					if (workspaces > 0) lines.push(`并从 ${workspaces} 个工作区移除登记。`);
+					if (pinned > 0) lines.push(`其中 ${pinned} 个已置顶，会一并取消。`);
+					return lines.join('\n');
+				},
+				archivedNotice: '已归档',
+				unarchivedNotice: '已取消归档',
+				purgedNotice: (removed, dirs) => `已删除 ${removed} 个会话、${dirs} 个日志目录`,
+				purgePartial: (failed, removed) => `已删除 ${removed} 个，${failed} 个日志目录被占用，请关闭占用后重试`,
+				sessionActive: (labels) => `会话仍有活动（${labels}），请先停止再删除`,
+				forbiddenOrigin: '请求来源不被允许（仅限本页面）',
 				mustArchiveFirst: '先归档，才能彻底删除',
 				runningRefused: '会话正在运行，请稍后再试',
 				sessionInUse: '会话仍被当前进程持有，重启后再试',
@@ -111,6 +126,20 @@ window.__ModuleLoader__.load({
 				confirmPurge: (title, kids) => kids > 0
 					? `Destroy "${title}" and its ${kids} subagent sessions? Their logs, cache and registry entries are removed permanently.`
 					: `Destroy "${title}"? Its logs, cache and registry entries are removed permanently.`,
+				confirmPurgeDetailed: (title, kids, dirs, size, cache, workspaces, pinned) => {
+					const lines = [`Destroy "${title}"? This cannot be undone.`];
+					if (kids > 0) lines.push(`Its ${kids} subagent sessions go with it.`);
+					lines.push(`Removes ${dirs} log directories (${size}) and ${cache} projection-cache records.`);
+					if (workspaces > 0) lines.push(`Detaches it from ${workspaces} workspaces.`);
+					if (pinned > 0) lines.push(`${pinned} of them pinned — the pins are dropped too.`);
+					return lines.join('\n');
+				},
+				archivedNotice: 'Archived',
+				unarchivedNotice: 'Unarchived',
+				purgedNotice: (removed, dirs) => `Removed ${removed} sessions and ${dirs} log directories`,
+				purgePartial: (failed, removed) => `Removed ${removed}; ${failed} log directories were in use — close them and retry`,
+				sessionActive: (labels) => `The session is still active (${labels}) — stop it first`,
+				forbiddenOrigin: 'This page is not allowed to make that request',
 				mustArchiveFirst: 'Archive it first, then it can be destroyed',
 				runningRefused: 'The session is running — try again later',
 				sessionInUse: 'This process still holds the session open — try again after a restart',
@@ -295,8 +324,28 @@ window.__ModuleLoader__.load({
 				body: JSON.stringify(payload),
 			});
 			const body = await response.json().catch(() => ({}));
-			if (!response.ok || body.ok !== true) throw new Error(body.error || `HTTP ${response.status}`);
+			if (!response.ok || body.ok !== true) {
+				// Keep the structured answer: a partial destroy names the ids that
+				// survived, and the caller needs them to say something useful.
+				const failure = new Error(body.error || `HTTP ${response.status}`);
+				failure.status = response.status;
+				failure.body = body;
+				throw failure;
+			}
 			return body;
+		}
+
+		/** Readable labels for the activity a refusal named, bounded to a line. */
+		function activityLabels(body) {
+			const groups = Array.isArray(body?.activity) ? body.activity : [];
+			const labels = [];
+			for (const group of groups) {
+				for (const entry of Array.isArray(group?.activity) ? group.activity : []) {
+					labels.push(entry?.label || entry?.kind || 'active');
+				}
+			}
+			const unique = [...new Set(labels)].slice(0, 3);
+			return unique.length === 0 ? 'active' : unique.join(', ');
 		}
 
 		async function fetchState() {
@@ -586,15 +635,23 @@ window.__ModuleLoader__.load({
 				markBusy(sessionId, true);
 				setNotice(null);
 				try {
-					await run();
-					await reload();
+					const message = await run();
+					if (typeof message === 'string' && message !== '') showNotice(message);
 				} catch (failure) {
 					const code = failure instanceof Error ? failure.message : '';
 					if (code === 'session-running') showNotice(s.runningRefused);
 					else if (code === 'session-in-use') showNotice(s.sessionInUse);
+					else if (code === 'session-active') showNotice(s.sessionActive(activityLabels(failure.body)));
 					else if (code === 'artifact-not-located') showNotice(s.artifactMissing);
-					else showNotice(`${s.actionFailed}: ${code}`);
+					else if (code === 'forbidden-origin') showNotice(s.forbiddenOrigin);
+					else if (code === 'purge-partial') {
+						const failed = Array.isArray(failure.body?.failed) ? failure.body.failed.length : 0;
+						showNotice(s.purgePartial(failed, failure.body?.removed ?? 0));
+					} else showNotice(`${s.actionFailed}: ${code}`);
 				} finally {
+					// Refresh even after a failure: a partial destroy already removed
+					// some files, and the rows must stop claiming otherwise.
+					await reload();
 					markBusy(sessionId, false);
 				}
 			};
@@ -616,17 +673,59 @@ window.__ModuleLoader__.load({
 			// that names how much of the subagent subtree goes with it.
 			const archiveToggle = (row) => {
 				const route = row.archived ? UNARCHIVE_ROUTE : ARCHIVE_ROUTE;
-				void withBusy(row.id, () => post(route, { sessionId: row.id }));
+				void withBusy(row.id, async () => {
+					await post(route, { sessionId: row.id });
+					return row.archived ? s.unarchivedNotice : s.archivedNotice;
+				});
 			};
 
-			const askPurge = (row) => {
-				if (!window.confirm(s.confirmPurge(row.title || s.unknownTitle, countSubtree(row)))) return;
+			/**
+			 * Ask the Host what a destroy would remove, then ask the user.
+			 *
+			 * The preview is what turns the confirmation from a title into the
+			 * actual footprint. A refusal it already knows (not archived, running,
+			 * still active work) is reported instead of asking a question the
+			 * destroy would refuse; an unexpected preview failure falls back to the
+			 * plain confirmation rather than blocking the action.
+			 */
+			const askPurge = async (row) => {
+				if (busyIds.has(row.id)) return;
+				const kids = countSubtree(row);
+				let preview = null;
+				try {
+					preview = await post(PREVIEW_ROUTE, { sessionId: row.id });
+				} catch (failure) {
+					const code = failure instanceof Error ? failure.message : '';
+					if (code === 'session-not-archived') return showNotice(s.mustArchiveFirst);
+					if (code === 'session-running') return showNotice(s.runningRefused);
+					if (code === 'session-in-use') return showNotice(s.sessionInUse);
+					if (code === 'session-active') return showNotice(s.sessionActive(activityLabels(failure.body)));
+					if (code === 'artifact-not-located') return showNotice(s.artifactMissing);
+					// Anything else (a transport hiccup, a slow probe) must not make
+					// the action impossible: fall through to the plain confirmation.
+				}
+
+				const title = row.title || s.unknownTitle;
+				const confirmed = preview === null
+					? window.confirm(s.confirmPurge(title, kids))
+					: window.confirm(s.confirmPurgeDetailed(
+						title,
+						kids,
+						preview.directories ?? 0,
+						formatBytes(preview.bytes) || '0 B',
+						preview.projectionRecords ?? 0,
+						Array.isArray(preview.workspaces) ? preview.workspaces.length : 0,
+						Array.isArray(preview.pinned) ? preview.pinned.length : 0,
+					));
+				if (!confirmed) return;
+
 				void withBusy(row.id, async () => {
-					await post(PURGE_ROUTE, { sessionId: row.id });
+					const body = await post(PURGE_ROUTE, { sessionId: row.id });
 					// The files and registry entries are gone, so the official
 					// list should stop naming it now rather than at the next
 					// refresh — the sidebar is visible behind this page.
 					forgetInOfficialList(row.id);
+					return s.purgedNotice(body.removed ?? 0, body.directories ?? 0);
 				});
 			};
 
@@ -638,7 +737,7 @@ window.__ModuleLoader__.load({
 				busy: busyIds.has(row.id),
 				onArchive: () => archiveToggle(row),
 				onUnarchive: () => archiveToggle(row),
-				onPurge: () => askPurge(row),
+				onPurge: () => { void askPurge(row); },
 			});
 
 			const renderGroup = (group) => {

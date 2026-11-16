@@ -40,7 +40,7 @@
  */
 import { mkdir, readFile, rename, rm, rmdir } from 'node:fs/promises'
 import { existsSync, readdirSync } from 'node:fs'
-import { dirname, join, relative, resolve, sep } from 'node:path'
+import { dirname, join, relative, resolve, sep, basename } from 'node:path'
 import { homedir } from 'node:os'
 
 export const name = 'dsh-toolbox-sessions'
@@ -192,6 +192,61 @@ function isInsideSessionsRoot(candidate) {
   return relative(root, resolved).split(sep).filter(Boolean).length >= 2
 }
 
+/**
+ * Whether `candidate` is one session's own log directory, judged by what it
+ * contains rather than by where it sits.
+ *
+ * A backend-supplied path (`locate()`, a snapshot's `location`) is authoritative
+ * about *its* persistence root, which a profile may configure away from
+ * `<DSH_HOME>/sessions`; rejecting it for living elsewhere made every destroy in
+ * such a profile fail with `artifact-not-located`. The path is trusted only when
+ * the directory's own name is the injective encoding of this exact id and it
+ * holds a session log generation, so an unrelated directory cannot be named.
+ */
+function isSessionDir(candidate, sessionId) {
+  if (typeof candidate !== 'string' || candidate === '') return false
+  const parent = dirname(candidate)
+  // Never the filesystem or drive root, and never a path with no parent.
+  if (parent === candidate) return false
+  if (!existsSync(candidate)) return false
+  let encoded
+  try {
+    encoded = encodeSegment(sessionId)
+  } catch {
+    return false
+  }
+  const fold = (value) => (process.platform === 'win32' ? value.toLowerCase() : value)
+  if (fold(basename(candidate)) !== fold(encoded)) return false
+  try {
+    return readdirSync(candidate).some((name) => /^session(\.v\d+)?\.jsonl(\.zstd)?$/.test(name))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Whether one mutating request may act.
+ *
+ * These routes destroy files, and a cross-origin page can send a `text/plain`
+ * "simple" POST to loopback without a preflight — the body is JSON either way,
+ * so the content-type buys nothing. A browser request therefore has to prove it
+ * is same-origin; a non-browser client (no `Sec-Fetch-Site` and no `Origin`) is
+ * left alone, because it is not the browser threat this guards against.
+ */
+function sameOrigin(req) {
+  const headers = req.headers ?? {}
+  const site = headers['sec-fetch-site']
+  if (typeof site === 'string' && site !== '') return site === 'same-origin' || site === 'none'
+  const origin = headers.origin
+  if (typeof origin !== 'string' || origin === '') return true
+  try {
+    const host = headers.host
+    return typeof host === 'string' && host !== '' && new URL(origin).host === host
+  } catch {
+    return false
+  }
+}
+
 // ── small helpers ──────────────────────────────────────────────────────────
 
 function readJsonBody(req) {
@@ -243,8 +298,8 @@ function headerOf(item) {
  *
  * `sessionPersistence.locate()` is `private` in the 0.2.x typings but present
  * at runtime, and it is the only source that knows a persistence root this
- * plugin did not derive. It is asked first and validated exactly like every
- * other candidate: a path outside the sessions root is ignored, never deleted.
+ * plugin did not derive. It is asked first and validated by content, so the
+ * answer counts in a profile whose root is not `<DSH_HOME>/sessions`.
  */
 function backendLocation(persistence, header) {
   if (persistence === undefined || header === undefined) return undefined
@@ -257,8 +312,13 @@ function backendLocation(persistence, header) {
   if (found === null || typeof found !== 'object') return undefined
   const path = found.path
   if (typeof path !== 'string') return undefined
-  const dir = path.endsWith('.jsonl') || path.endsWith('.zstd') ? dirname(path) : path
-  return existsSync(dir) && isInsideSessionsRoot(dir) ? dir : undefined
+  const dir = stripLogSuffix(path)
+  return isSessionDir(dir, header.id) ? dir : undefined
+}
+
+/** `<…>/<id>/session.v3.jsonl.zstd` and the directory form both name a session dir. */
+function stripLogSuffix(path) {
+  return path.endsWith('.jsonl') || path.endsWith('.zstd') ? dirname(path) : path
 }
 
 /**
@@ -268,20 +328,25 @@ function backendLocation(persistence, header) {
  * `location.path`, then the on-disk layout
  * `<DSH_HOME>/sessions/<projectKey(cwd)>/<encoded id>/`.
  *
- * Every candidate must resolve inside the sessions root, so a snapshot that
- * points somewhere else cannot make a destroy delete an unrelated directory.
+ * Backend-supplied paths are validated by content (`isSessionDir`), derived and
+ * scanned ones by the sessions-root prefix: those are this plugin's own guess,
+ * so they must stay inside the root it guessed.
  */
 function locateSessionDir(persistence, snapshot, sessionId, cwd) {
   const header = snapshot === undefined ? undefined : headerOf(snapshot)
-  const backend = backendLocation(persistence, header)
-  if (backend !== undefined) return backend
 
+  // The snapshot's own location first: it is free (no directory read), and the
+  // panel resolves one per row on every poll. Inside the documented root it is
+  // accepted on the backend's word; elsewhere it has to prove itself.
   const location = snapshot === undefined ? undefined : snapshot.location
   if (location && typeof location.path === 'string') {
-    const candidate = location.path
-    const dir = candidate.endsWith('.jsonl') || candidate.endsWith('.zstd') ? dirname(candidate) : candidate
-    if (existsSync(dir) && isInsideSessionsRoot(dir)) return dir
+    const dir = stripLogSuffix(location.path)
+    if (isInsideSessionsRoot(dir) && existsSync(dir)) return dir
+    if (isSessionDir(dir, sessionId)) return dir
   }
+
+  const backend = backendLocation(persistence, header)
+  if (backend !== undefined) return backend
   const root = sessionsRoot()
   if (!existsSync(root)) return undefined
   // The cwd-derived path first: it is the layout the backend writes, and
@@ -700,6 +765,10 @@ export function apply(ctx) {
         respond(res, 405, { ok: false, error: 'method-not-allowed' })
         return undefined
       }
+      if (!sameOrigin(req)) {
+        respond(res, 403, { ok: false, error: 'forbidden-origin' })
+        return undefined
+      }
       let body
       try {
         body = await readJsonBody(req)
@@ -740,8 +809,63 @@ export function apply(ctx) {
 
     // ── mutations ──────────────────────────────────────────────────────────
     //
-    // Every route below runs through `serialize`, so two clicks land one after
-    // the other instead of interleaving their steps.
+    // Every mutating route runs through `serialize`, so two clicks land one
+    // after the other instead of interleaving their steps.
+
+    /** Which refusal, if any, the current listing gives for this subtree. */
+    const findBusy = (items, targets, liveStore) => {
+      for (const targetId of targets) {
+        const item = items.find((entry) => entry.sessionId === targetId)
+        if (item !== undefined) {
+          if (item.running === true) return 'session-running'
+          if (item.agentAvailable === true) return 'session-in-use'
+        }
+        // A live session can sit in the store without an agent (retained, or
+        // prepared and not yet announced). The Host would keep listing it after
+        // the files are gone, so it is refused the same way.
+        let live
+        try {
+          live = liveStore === undefined ? undefined : liveStore.get(targetId)
+        } catch {
+          live = undefined
+        }
+        if (live !== undefined) return 'session-in-use'
+      }
+      return undefined
+    }
+
+    /**
+     * What still counts as work on this session.
+     *
+     * The registry's archive gate asks the same waterfall, so a job or schedule
+     * naming the session is exactly what would have refused an archive. Purge
+     * has to ask it itself: it destroys a session that may have been archived
+     * before that work appeared. A missing event or a failing listener leaves
+     * the answer empty rather than blocking every destroy.
+     */
+    const sessionActivity = async (sessionId) => {
+      const waterfall = scoped.waterfall
+      if (typeof waterfall !== 'function') return []
+      try {
+        const result = await waterfall.call(
+          scoped,
+          'workspace/session-activity',
+          { sessionId },
+          () => Promise.resolve([]),
+        )
+        return Array.isArray(result) ? result : []
+      } catch (error) {
+        scoped.logger.warn(`[dsh-toolbox] activity check failed for ${sessionId}:`, error)
+        return []
+      }
+    }
+
+    /** Activity entries small enough to send to the panel. */
+    const describeActivity = (activity) => activity.map((entry) => ({
+      kind: typeof entry?.kind === 'string' ? entry.kind : 'active',
+      id: typeof entry?.id === 'string' ? entry.id : undefined,
+      label: typeof entry?.label === 'string' ? entry.label : undefined,
+    }))
 
     // The reversible step, from the panel.
     const archiveSession = async (sessionId, res) => {
@@ -754,6 +878,18 @@ export function apply(ctx) {
         await registry().archiveSession(sessionId)
         respond(res, 200, { ok: true })
       } catch (error) {
+        // The registry refuses a session with live work — a running turn, a job,
+        // a schedule — and one that neither memory nor persistence knows.
+        if (error?.name === 'WorkspaceActiveSessionError') {
+          return respond(res, 409, {
+            ok: false,
+            error: 'session-active',
+            activity: describeActivity(Array.isArray(error.activity) ? error.activity : []),
+          })
+        }
+        if (error?.name === 'WorkspaceUnknownSessionError') {
+          return respond(res, 404, { ok: false, error: 'session-not-found' })
+        }
         scoped.logger.warn('[dsh-toolbox] archive failed:', error)
         respond(res, 500, { ok: false, error: 'archive-failed' })
       }
@@ -771,6 +907,90 @@ export function apply(ctx) {
       }
     }
 
+    /**
+     * What a destroy would remove, without removing anything.
+     *
+     * The panel reads this before it asks, so the confirmation names the
+     * subtree, the bytes, the cache records and the workspaces instead of a bare
+     * title. It applies the same gates as the real route — archived, not busy —
+     * so a preview that says yes is not followed by a destroy that says no.
+     */
+    const previewSession = async (sessionId, res) => {
+      try {
+        if (persistence() === undefined) return respond(res, 503, { ok: false, error: 'persistence-unavailable' })
+        const snapshots = await persistence().list()
+        const snapshotById = new Map()
+        for (const snapshot of snapshots) snapshotById.set(headerOf(snapshot).id, snapshot)
+        const control = controller()
+        const items = control === undefined ? [] : (await control.list({}, new AbortController().signal)).items
+        const summary = items.find((item) => item.sessionId === sessionId)
+        const snapshot = snapshotById.get(sessionId)
+        if (summary === undefined && snapshot === undefined) {
+          return respond(res, 404, { ok: false, error: 'session-not-found' })
+        }
+
+        const header = snapshot === undefined ? undefined : headerOf(snapshot)
+        const targets = [sessionId, ...collectDescendants(items, snapshots.map(headerOf), sessionId)]
+        const isSubagent = summary?.origin === 'subagent' || header?.origin === 'subagent'
+        if (!isSubagent && !archivedSet().has(sessionId)) {
+          return respond(res, 409, { ok: false, error: 'session-not-archived' })
+        }
+
+        const rows = []
+        for (const targetId of targets) {
+          const targetSnapshot = snapshotById.get(targetId)
+          const targetHeader = targetSnapshot === undefined ? undefined : headerOf(targetSnapshot)
+          const item = items.find((entry) => entry.sessionId === targetId)
+          const dir = locateSessionDir(
+            persistence(),
+            targetSnapshot,
+            targetId,
+            targetHeader?.cwd ?? summary?.cwd ?? header?.cwd,
+          )
+          const title = item?.projections?.values?.title
+          rows.push({
+            id: targetId,
+            title: typeof title === 'string' && title.trim() !== '' ? title : undefined,
+            isSubagent: (item?.origin ?? targetHeader?.origin) === 'subagent',
+            sizeBytes: typeof targetSnapshot?.sizeBytes === 'number' ? targetSnapshot.sizeBytes : undefined,
+            hasLog: dir !== undefined,
+            running: item?.running === true,
+            agentAvailable: item?.agentAvailable === true,
+          })
+        }
+
+        const cache = storage()?.get('session_projcache')
+        const cacheTable = cache === undefined ? undefined : cache.table('sessions')
+        const registryRows = registry()?.list() ?? []
+        const workspaces = registryRows.filter((workspace) => targets.some((id) => workspace.sessionIds.includes(id)))
+        const pinnedIds = registry()?.pinnedSessionIds
+        const activity = []
+        for (const targetId of targets) {
+          const active = await sessionActivity(targetId)
+          if (active.length > 0) activity.push({ sessionId: targetId, activity: describeActivity(active) })
+        }
+
+        respond(res, 200, {
+          ok: true,
+          sessionId,
+          archived: archivedSet().has(sessionId),
+          busy: findBusy(items, targets, scoped.get('sessions')) ?? null,
+          sessions: rows,
+          directories: rows.filter((row) => row.hasLog).length,
+          bytes: rows.reduce((sum, row) => sum + (row.sizeBytes ?? 0), 0),
+          workspaces: workspaces.map((workspace) => workspace.id),
+          pinned: Array.isArray(pinnedIds) ? pinnedIds.filter((id) => targets.includes(id)) : [],
+          projectionRecords: cacheTable === undefined
+            ? 0
+            : targets.filter((id) => cacheTable.get(id) !== undefined).length,
+          activity,
+        })
+      } catch (error) {
+        scoped.logger.warn('[dsh-toolbox] preview failed:', error)
+        respond(res, 500, { ok: false, error: 'preview-failed' })
+      }
+    }
+
     // Permanent, and meant to leave nothing behind.
     //
     // Only an archived session may be destroyed: archiving is the reversible
@@ -784,38 +1004,26 @@ export function apply(ctx) {
     // be a trace nobody could reach, only one the orphan bucket could find.
     const purgeSession = async (sessionId, res) => {
       try {
-        const control = controller()
-        const items = control === undefined
-          ? []
-          : (await control.list({}, new AbortController().signal)).items
-        const summary = items.find((item) => item.sessionId === sessionId)
-
-        const snapshots = persistence() === undefined ? [] : await persistence().list()
+        // Without this service the listing below cannot tell "no log" from
+        // "cannot look": both would come back empty, and the registry would be
+        // cleared for a log that is still on disk.
+        if (persistence() === undefined) {
+          return respond(res, 503, { ok: false, error: 'persistence-unavailable' })
+        }
+        const snapshots = await persistence().list()
         const snapshotById = new Map()
         for (const snapshot of snapshots) snapshotById.set(headerOf(snapshot).id, snapshot)
 
+        const control = controller()
+        const items = control === undefined ? [] : (await control.list({}, new AbortController().signal)).items
+        const summary = items.find((item) => item.sessionId === sessionId)
         const targets = [sessionId, ...collectDescendants(items, snapshots.map(headerOf), sessionId)]
 
         // Refuse the whole subtree when any part of it is busy: a destroy that
         // half-completes would leave exactly the kind of trace this route is
         // supposed to avoid.
-        const liveStore = scoped.get('sessions')
-        for (const targetId of targets) {
-          const item = items.find((entry) => entry.sessionId === targetId)
-          if (item === undefined) continue
-          if (item.running === true) return respond(res, 409, { ok: false, error: 'session-running' })
-          if (item.agentAvailable === true) return respond(res, 409, { ok: false, error: 'session-in-use' })
-          // A live session can sit in the store without an agent (retained, or
-          // prepared and not yet announced). The Host would keep listing it
-          // after the files are gone, so it is refused the same way.
-          let live
-          try {
-            live = liveStore === undefined ? undefined : liveStore.get(targetId)
-          } catch {
-            live = undefined
-          }
-          if (live !== undefined) return respond(res, 409, { ok: false, error: 'session-in-use' })
-        }
+        const initialBusy = findBusy(items, targets, scoped.get('sessions'))
+        if (initialBusy !== undefined) return respond(res, 409, { ok: false, error: initialBusy })
 
         const snapshot = snapshotById.get(sessionId)
         const header = snapshot === undefined ? undefined : headerOf(snapshot)
@@ -828,13 +1036,24 @@ export function apply(ctx) {
           return respond(res, 409, { ok: false, error: 'session-not-archived' })
         }
 
+        // Work the archive gate would name: a job or a schedule can appear
+        // after the session was archived, and destroying the session under it
+        // would leave that work pointing at nothing.
+        const active = []
+        for (const targetId of targets) {
+          const activity = await sessionActivity(targetId)
+          if (activity.length > 0) active.push({ sessionId: targetId, activity: describeActivity(activity) })
+        }
+        if (active.length > 0) return respond(res, 409, { ok: false, error: 'session-active', activity: active })
+
         // 0) Preflight. Resolve every artifact directory before deleting
         //    anything. A snapshot without a locatable directory means the
-        //    backend knows a log this build cannot find — a moved root, a newer
-        //    layout. Reporting success there would clear the registry while
-        //    leaving the log on disk for nobody to reach, so it refuses the
-        //    whole subtree instead. A target with no snapshot has no log at all
-        //    (a blank session, or the residue of an earlier destroy).
+        //    backend knows a log this build cannot find — a newer layout, or a
+        //    directory whose name does not encode the id. Reporting success
+        //    there would clear the registry while leaving the log on disk for
+        //    nobody to reach, so it refuses the whole subtree instead. A target
+        //    with no snapshot has no log at all (a blank session, or the
+        //    residue of an earlier destroy).
         const plans = []
         for (const targetId of targets) {
           const targetSnapshot = snapshotById.get(targetId)
@@ -855,36 +1074,82 @@ export function apply(ctx) {
           plans.push({ id: targetId, dir })
         }
 
-        // 1) The log directories, with everything inside them.
-        for (const plan of plans) await rm(plan.dir, { recursive: true, force: true })
+        // The checks above ran while two listings were read; re-read the live
+        // state here, immediately before the first irreversible step, so a
+        // session resumed in that window is still refused.
+        const late = controller() === undefined
+          ? []
+          : (await controller().list({}, new AbortController().signal)).items
+        const lateBusy = findBusy(late, targets, scoped.get('sessions'))
+        if (lateBusy !== undefined) return respond(res, 409, { ok: false, error: lateBusy })
+
+        // 1) The log directories, children first: if one fails, the parent row
+        //    (with its retry button) survives instead of every child becoming an
+        //    orphan. A busy file is retried a few times before it is reported.
+        const failures = []
+        for (const plan of [...plans].reverse()) {
+          try {
+            await rm(plan.dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+          } catch (error) {
+            failures.push({ sessionId: plan.id, code: typeof error?.code === 'string' ? error.code : 'rm-failed' })
+            scoped.logger.warn(`[dsh-toolbox] could not remove ${plan.dir}:`, error)
+          }
+        }
+        const failed = new Set(failures.map((entry) => entry.sessionId))
+        const cleaned = targets.filter((id) => !failed.has(id))
 
         // 2) The projection-cache records that live outside the log directories.
-        for (const targetId of targets) await dropProjectionRecord(targetId)
+        for (const targetId of cleaned) await dropProjectionRecord(targetId)
 
-        // 3) Every registry entry that names the session. Removing these is
-        //    what keeps the sidebar's pin/archive sets and the Ungrouped
-        //    bucket from remembering it, and it is what makes the archive
-        //    flag itself disappear.
-        let detached = true
+        // 3) Every registry entry that names the session. Cleanup is per
+        //    target: one workspace failure must not keep another session's
+        //    archive flag alive. Removing these is what keeps the sidebar's
+        //    pin/archive sets and the Ungrouped bucket from remembering it.
+        const notDetached = new Set()
+        let workspaces
         try {
-          for (const workspace of registry()?.list() ?? []) {
-            for (const targetId of targets) {
-              if (workspace.sessionIds.includes(targetId)) await workspace.detachSession(targetId)
+          workspaces = registry()?.list() ?? []
+        } catch (error) {
+          scoped.logger.warn('[dsh-toolbox] workspace listing failed:', error)
+          workspaces = []
+          for (const targetId of cleaned) notDetached.add(targetId)
+        }
+        for (const targetId of cleaned) {
+          for (const workspace of workspaces) {
+            if (!workspace.sessionIds.includes(targetId)) continue
+            try {
+              await workspace.detachSession(targetId)
+            } catch (error) {
+              notDetached.add(targetId)
+              scoped.logger.warn(`[dsh-toolbox] could not detach ${targetId}:`, error)
             }
           }
-        } catch (error) {
-          detached = false
-          scoped.logger.warn('[dsh-toolbox] detach failed:', error)
         }
-        try {
-          for (const targetId of targets) await registry()?.unpinSession(targetId)
+        for (const targetId of cleaned) {
+          try {
+            await registry()?.unpinSession(targetId)
+          } catch (error) {
+            scoped.logger.warn(`[dsh-toolbox] could not unpin ${targetId}:`, error)
+          }
+        }
+        for (const targetId of cleaned) {
           // Unarchiving is only safe once the session has no workspace slot:
           // otherwise it would come back as an empty "Ungrouped" row.
-          if (detached) {
-            for (const targetId of targets) await registry()?.unarchiveSession(targetId)
+          if (notDetached.has(targetId)) continue
+          try {
+            await registry()?.unarchiveSession(targetId)
+          } catch (error) {
+            scoped.logger.warn(`[dsh-toolbox] could not unarchive ${targetId}:`, error)
           }
-        } catch (error) {
-          scoped.logger.warn('[dsh-toolbox] registry cleanup failed:', error)
+        }
+
+        if (failures.length > 0) {
+          return respond(res, 500, {
+            ok: false,
+            error: 'purge-partial',
+            removed: cleaned.length,
+            failed: failures.map((entry) => entry.sessionId),
+          })
         }
 
         respond(res, 200, { ok: true, removed: targets.length, directories: plans.length })
@@ -893,6 +1158,17 @@ export function apply(ctx) {
         respond(res, 500, { ok: false, error: 'purge-failed' })
       }
     }
+
+    // POST /dsh-toolbox/preview — what a destroy would remove, read-only.
+    scoped.webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/preview`,
+      handler: async (req, res) => {
+        const id = await readId(req, res)
+        if (id === undefined) return
+        await serialize(() => previewSession(id, res))
+      },
+    })
 
     // POST /dsh-toolbox/archive — hide a session in the sidebar, files intact.
     scoped.webServer.register({
